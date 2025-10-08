@@ -1,96 +1,79 @@
-// YFL MCP Bridge — Streamable HTTP transport (Render)
-// - POST /mcp  -> MCP JSON-RPC (initialize/tools.list/tools.call)
-// - GET  /echo -> health
-//
-// Proxies tools to your Apps Script worker:
-//   GET {GAS_BASE}/api/search?q=...&max=...&token=TOKEN
-//   GET {GAS_BASE}/api/fetch?id=...&token=TOKEN
-//
-// Based on the official SDK quick-start pattern:
-// https://github.com/modelcontextprotocol/typescript-sdk (Quickstart).
+// server.js — YFL MCP Bridge (stateless)
+// Express HTTP endpoint `/mcp` that ChatGPT can call via api_tool.
+// Tools: drive_search, drive_fetch. No interactive prompts, ever.
+
 import express from 'express';
-import cors from 'cors';
-import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import fetch from 'node-fetch';
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 
-// ---- env ----
-const GAS_BASE      = (process.env.GAS_BASE || '').replace(/\/$/, '');  // e.g. https://script.google.com/.../exec
-const TOKEN         = process.env.TOKEN || '';                          // CFG.TOKEN from Apps Script
-const BRIDGE_TOKEN  = process.env.BRIDGE_TOKEN || '';                   // optional extra gate for /mcp
+const PORT = process.env.PORT || 10000;
+const GAS_BASE = process.env.GAS_BASE;                // e.g., https://script.google.com/macros/s/.../exec
+const TK = process.env.GDRIVE_TEXT_TOKEN;             // must match Apps Script TOKEN
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';  // optional: used only for your own bookkeeping
 
-if (!GAS_BASE || !TOKEN) {
-  console.error('Missing env vars: GAS_BASE or TOKEN'); process.exit(1);
+if (!GAS_BASE || !TK) {
+  console.error('Missing GAS_BASE or GDRIVE_TEXT_TOKEN env vars.');
+  process.exit(1);
 }
 
-// Helper to build Apps Script URLs
-function gasUrl(path, params = {}) {
-  const u = new URL(GAS_BASE + (path.startsWith('/') ? path : '/' + path));
-  u.searchParams.set('token', TOKEN);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
-  }
-  return u.toString();
-}
+// Simple health
+app.get('/', (_, res) => res.json({ ok: true, name: 'yfl-mcp-bridge', ts: Date.now() }));
 
-// ---- MCP server & tools ----
-const server = new McpServer({ name: 'YFL GAS Bridge', version: '0.2.0' });
-
-server.registerTool(
-  'drive_search',
-  {
-    title: 'Drive search',
-    description: 'Search Google Drive by filename (contains).',
-    inputSchema: { q: z.string(), max: z.number().int().min(1).max(50).optional() },
-    outputSchema: z.any()
-  },
-  async ({ q, max }) => {
-    const r = await fetch(gasUrl('/api/search', { q, max: max ?? 10 }));
-    const data = await r.json();
-    return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
-  }
-);
-
-server.registerTool(
-  'drive_fetch',
-  {
-    title: 'Drive fetch',
-    description: 'Fetch text content for a Drive file ID (TXT/CSV/Docs/Sheets; truncated).',
-    inputSchema: { id: z.string() },
-    outputSchema: z.any()
-  },
-  async ({ id }) => {
-    const r = await fetch(gasUrl('/api/fetch', { id }));
-    const data = await r.json();
-    return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
-  }
-);
-
-// ---- health
-app.get('/echo', (_req, res) => {
-  res.json({ ok: true, message: 'YFL MCP Bridge up', gasBase: GAS_BASE });
-});
-
-// ---- MCP endpoint (Streamable HTTP; stateless session per official docs)
+// 1) List tools (non-interactive)
 app.post('/mcp', async (req, res) => {
-  // Optional: small gate so randoms can’t hit /mcp unless they know a token
-  if (BRIDGE_TOKEN) {
-    const q = String(req.query.token || '');
-    if (q !== BRIDGE_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const body = req.body || {};
+    const { op, name, args } = body;
+
+    // Handshake: list available operations
+    if (!op || op === 'list') {
+      return res.json({
+        ok: true,
+        name: 'YFL MCP Bridge',
+        interactive: false,
+        tools: [
+          {
+            name: 'drive_search',
+            interactive: false,
+            args_schema: { type: 'object', properties: { q: { type: 'string' }, max: { type: 'number' } }, required: ['q'] }
+          },
+          {
+            name: 'drive_fetch',
+            interactive: false,
+            args_schema: { type: 'object', properties: { id: { type: 'string' }, lines: { type: 'number' } }, required: ['id'] }
+          }
+        ]
+      });
+    }
+
+    // 2) Call tool
+    if (op === 'call' && name === 'drive_search') {
+      const q = (args?.q || '').trim();
+      const max = Number(args?.max || 10);
+      const url = `${GAS_BASE}/drive_search?q=${encodeURIComponent(q)}&max=${max}&tk=${encodeURIComponent(TK)}`;
+      const r = await fetch(url);
+      const data = await r.json();
+      return res.json({ ok: true, result: data });
+    }
+
+    if (op === 'call' && name === 'drive_fetch') {
+      const id = (args?.id || '').trim();
+      const lines = Number(args?.lines || 0);
+      const url = `${GAS_BASE}/drive_fetch?id=${encodeURIComponent(id)}${lines ? `&lines=${lines}` : ''}&tk=${encodeURIComponent(TK)}`;
+      const r = await fetch(url);
+      const data = await r.json();
+      return res.json({ ok: true, result: data });
+    }
+
+    return res.status(400).json({ ok: false, error: 'unknown_op_or_tool', body });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: String(err) });
   }
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,  // new session per request (stateless)
-    enableJsonResponse: true
-  });
-  res.on('close', () => transport.close());
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
 });
 
-// ---- start
-const port = parseInt(process.env.PORT || '3000', 10);
-app.listen(port, () => console.log(`YFL MCP Bridge listening on :${port} (POST /mcp)`));
+app.listen(PORT, () => {
+  console.log(`YFL MCP Bridge listening on :${PORT} (POST /mcp)`);
+});
