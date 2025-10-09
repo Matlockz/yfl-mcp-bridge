@@ -1,46 +1,70 @@
-// server.js  (ESM)
-// Adds permissive CORS (incl. preflight) + GET /mcp SSE fallback,
-// and a JSON-RPC /mcp handler compatible with ChatGPT’s connector.
+// YFL MCP Bridge — HTTP transport + Apps Script proxy
+// ESM syntax, Node >=18
 
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
+// ------------------ env ------------------
+const PORT = process.env.PORT || 10000;              // Render will inject 10000
+const GAS_BASE_URL = process.env.GAS_BASE_URL || '';
+const GAS_KEY = process.env.GAS_KEY || '';
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '';
+const PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
+
+// ------------------ app ------------------
 const app = express();
 
-// --- CORS: allow ChatGPT browser calls (preflight + custom headers)
-const corsOpts = {
-  origin: true,                           // reflect request Origin
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'MCP-Protocol-Version',
-    'MCP-Client',
-    'X-Requested-With',
-    'Authorization'
-  ],
-  exposedHeaders: ['Content-Type'],
-  optionsSuccessStatus: 204
-};
-app.use(cors(corsOpts));
-app.options('*', cors(corsOpts));
+// CORS: allow ChatGPT (and fall back to *)
+const ALLOW_ORIGINS = new Set([
+  'https://chat.openai.com',
+  'https://chatgpt.com',
+  'https://stg.chat.openai.com',
+  'http://localhost:5173',
+  'http://localhost:3000'
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (ALLOW_ORIGINS.has(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    // fine for this bridge; tighten later if you want
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type,MCP-Protocol-Version,MCP-Client,Authorization,X-Requested-With'
+  );
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 
 app.use(express.json({ limit: '1mb' }));
+app.use(cors());
 
-const PORT = process.env.PORT || 10000;
-const GAS_BASE_URL = process.env.GAS_BASE_URL;
-const GAS_KEY      = process.env.GAS_KEY;
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
+// ------------------ helpers ------------------
+function setMcpHeaders(res) {
+  res.setHeader('MCP-Protocol-Version', PROTOCOL);
+}
 
-// ---- helper: call Apps Script Web App
-async function gasCall(action, params = {}) {
-  if (!GAS_BASE_URL || !GAS_KEY) {
-    throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
-  }
+function jsonrpcOk(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function jsonrpcErr(id, code, message, data) {
+  return { jsonrpc: '2.0', id, error: { code, message, data } };
+}
+
+async function gasCall(action, params) {
+  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
   const url = new URL(GAS_BASE_URL);
   url.searchParams.set('action', action);
   url.searchParams.set('key', GAS_KEY);
-  for (const [k, v] of Object.entries(params)) {
+  for (const [k, v] of Object.entries(params || {})) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
   const r = await fetch(url, { method: 'GET' });
@@ -49,141 +73,154 @@ async function gasCall(action, params = {}) {
   return j;
 }
 
-// ---- simple local API key for /search & /fetch (not used by /mcp)
+// local API key for /search and /fetch (handy smoke tests)
 function requireKey(req, res, next) {
   const k = req.header('x-api-key') || req.query.api_key;
-  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
-  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid x-api-key' });
+  if (!BRIDGE_API_KEY) return res.status(500).json({ ok: false, error: 'Server missing BRIDGE_API_KEY' });
+  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok: false, error: 'Missing or invalid x-api-key' });
   next();
 }
 
-// ---- health
+// ------------------ health ------------------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ---- Friendly smoke-test endpoints
+// ------------------ friendly GETs ------------------
 app.get('/search', requireKey, async (req, res) => {
   try {
     const { q = '', max = 5 } = req.query;
     const data = await gasCall('search', { q, max });
     res.json({ ok: true, data });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 app.get('/fetch', requireKey, async (req, res) => {
   try {
     const { id, lines } = req.query;
-    if (!id) return res.status(400).json({ ok:false, error:'Missing id' });
+    if (!id) return res.status(400).json({ ok: false, error: 'Missing id' });
     const data = await gasCall('fetch', { id, lines });
     res.json({ ok: true, data });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ---- MCP (JSON-RPC over HTTP) ---------------------------------
+// ------------------ MCP: SSE negotiation (GET /mcp) ------------------
+app.get('/mcp', (req, res) => {
+  setMcpHeaders(res);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
 
-function jsonRpcResult(id, result) {
-  return { jsonrpc: '2.0', id, result };
-}
-function jsonRpcError(id, code, message) {
-  return { jsonrpc: '2.0', id, error: { code, message } };
-}
+  const host = req.get('host');
+  const scheme = req.protocol;
+  const token = req.query.token || '';
 
+  const messagesUrl = new URL(`${scheme}://${host}/mcp/messages`);
+  if (token) messagesUrl.searchParams.set('token', token);
+
+  // The connector expects an `endpoint` event containing the messages URL.
+  const payload = {
+    messages: messagesUrl.toString(),
+    protocolVersion: PROTOCOL
+  };
+
+  res.write(`event: endpoint\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+  const keep = setInterval(() => res.write(`: keepalive\n\n`), 25000);
+  req.on('close', () => clearInterval(keep));
+});
+
+// ------------------ MCP: JSON-RPC endpoint (POST /mcp + /mcp/messages) ------------------
 async function handleMcp(req, res) {
   try {
-    const { id, method, params } = req.body || {};
-    if (!id || !method) return res.json(jsonRpcError(id ?? null, -32600, 'Invalid Request'));
+    setMcpHeaders(res);
+    const { jsonrpc, id, method, params = {} } = req.body || {};
+    if (jsonrpc !== '2.0') return res.json(jsonrpcErr(id ?? null, -32600, 'Invalid Request'));
 
+    // ---- REQUIRED by spec: initialize must return capabilities + serverInfo ----
     if (method === 'initialize') {
-      // we speak the 2024-11-05 protocol (ChatGPT negotiates)
-      return res.json(jsonRpcResult(id, { protocolVersion: '2024-11-05' }));
+      return res.json(jsonrpcOk(id, {
+        protocolVersion: PROTOCOL,
+        capabilities: {
+          tools: { listChanged: true }   // we expose tools and support listChanged
+        },
+        serverInfo: {
+          name: 'yfl-drive-bridge',
+          title: 'YFL Drive Bridge',
+          version: '1.0.0'
+        },
+        instructions: 'Tools available: drive_search, drive_fetch.'
+      }));
+    }
+
+    // This is a notification (no id) — acknowledge with empty body
+    if (method === 'notifications/initialized') {
+      return res.status(200).end();
     }
 
     if (method === 'tools/list') {
-      const tools = [
-        {
-          name: 'drive_search',
-          description: 'Search Drive by title',
-          inputSchema: {
-            type: 'object',
-            properties: { q: { type: 'string' }, max: { type: 'number' } }
+      return res.json(jsonrpcOk(id, {
+        tools: [
+          {
+            name: 'drive_search',
+            description: 'Search Drive by title',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                q:   { type: 'string' },
+                max: { type: 'number' }
+              }
+            }
+          },
+          {
+            name: 'drive_fetch',
+            description: 'Fetch Drive file by id',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                id:    { type: 'string' },
+                lines: { type: 'number' }
+              }
+            }
           }
-        },
-        {
-          name: 'drive_fetch',
-          description: 'Fetch Drive file by id',
-          inputSchema: {
-            type: 'object',
-            properties: { id: { type: 'string' }, lines: { type: 'number' } }
-          }
-        }
-      ];
-      return res.json(jsonRpcResult(id, { tools }));
+        ]
+      }));
     }
 
     if (method === 'tools/call') {
-      const name = params?.name;
-      const args = params?.arguments || {};
+      const { name, arguments: args = {} } = params;
 
       if (name === 'drive_search') {
-        const q   = args.q   ?? '';
-        const max = args.max ?? 5;
+        const { q = '', max = 5 } = args;
         const data = await gasCall('search', { q, max });
-        return res.json(jsonRpcResult(id, { content: [{ type: 'json', json: data }] }));
+        // Return as MCP content block
+        return res.json(jsonrpcOk(id, { content: [{ type: 'json', json: data }] }));
       }
 
       if (name === 'drive_fetch') {
-        const fid   = args.id;
-        const lines = args.lines;
-        if (!fid) return res.json(jsonRpcError(id, -32602, 'Missing id'));
-        const data = await gasCall('fetch', { id: fid, lines });
+        const { id: fileId, lines } = args;
+        if (!fileId) return res.json(jsonrpcErr(id, -32602, 'Missing id'));
+        const data = await gasCall('fetch', { id: fileId, lines });
+        const payload = data?.data?.data || data?.data || data;
 
-        // If Apps Script returned inline text, surface it as text, else JSON
-        const asText = data?.data?.inline && typeof data?.data?.text === 'string';
-        const content = asText
-          ? [{ type: 'text', text: data.data.text }]
-          : [{ type: 'json', json: data }];
-
-        return res.json(jsonRpcResult(id, { content }));
+        if (payload?.inline && typeof payload.text === 'string') {
+          return res.json(jsonrpcOk(id, { content: [{ type: 'text', text: payload.text }] }));
+        }
+        return res.json(jsonrpcOk(id, { content: [{ type: 'json', json: data }] }));
       }
 
-      return res.json(jsonRpcError(id, -32601, 'Unknown tool'));
+      return res.json(jsonrpcErr(id, -32601, 'Unknown tool'));
     }
 
-    return res.json(jsonRpcError(id, -32601, 'Unknown method'));
-  } catch (e) {
-    return res.status(500).json(jsonRpcError(req.body?.id ?? null, -32000, e.message));
+    return res.json(jsonrpcErr(id, -32601, 'Unknown method'));
+  } catch (err) {
+    return res.json(jsonrpcErr(req.body?.id ?? null, -32000, 'Internal error', String(err?.message || err)));
   }
 }
 
-// Primary JSON‑RPC endpoint
 app.post('/mcp', handleMcp);
-// Compatibility path (older tooling posts here)
 app.post('/mcp/messages', handleMcp);
 
-// GET /mcp – compatibility SSE that tells the client where to POST messages
-app.get('/mcp', (req, res) => {
-  res.set({
-    'Content-Type' : 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection'   : 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
-  const proto = req.headers['x-forwarded-proto'] || req.protocol;
-  const origin = `${proto}://${req.get('host')}`;
-  const token = req.query.token ? `?token=${encodeURIComponent(req.query.token)}` : '';
-  const messagesUrl = `${origin}/mcp/messages${token}`;
-
-  const payload = JSON.stringify({ messages: messagesUrl });
-  res.write(`event: endpoint\n`);
-  res.write(`data: ${payload}\n\n`);
-  // keep the stream open so the client sees it as SSE; send keepalives:
-  const ping = setInterval(() => res.write(`: keepalive\n\n`), 25000);
-  req.on('close', () => clearInterval(ping));
-});
-
+// ------------- start -------------
 app.listen(PORT, () => {
   console.log(`YFL bridge listening on http://localhost:${PORT}`);
 });
