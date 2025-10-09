@@ -1,4 +1,4 @@
-// server.mjs
+// server.js  (drop-in)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -7,29 +7,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---- env ----
 const PORT = process.env.PORT || 3332;
-const GAS_BASE_URL = process.env.GAS_BASE_URL;   // e.g. https://script.google.com/.../exec
-const GAS_KEY      = process.env.GAS_KEY;        // your Apps Script shared key
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY; // your local/connector shared key
+const GAS_BASE_URL = process.env.GAS_BASE_URL;
+const GAS_KEY = process.env.GAS_KEY;
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 
-// ---- guards ----
-function requireHeaderKey(req, res, next) {
+// ---- simple API key check for /search & /fetch ----
+function requireKey(req, res, next) {
   const k = req.header('x-api-key') || req.query.api_key;
-  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
+  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error: 'Server missing BRIDGE_API_KEY' });
   if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid x-api-key' });
   next();
 }
-function requireTokenQuery(req, res, next) {
-  const t = req.query.token || req.query.tk || '';
-  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
-  if (t !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid token' });
-  next();
-}
 
-// ---- Apps Script call helper ----
+// ---- call Apps Script Web App ----
 async function gasCall(action, params) {
-  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
+  if (!GAS_BASE_URL || !GAS_KEY) {
+    throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
+  }
   const url = new URL(GAS_BASE_URL);
   url.searchParams.set('action', action);
   url.searchParams.set('key', GAS_KEY);
@@ -37,122 +32,114 @@ async function gasCall(action, params) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
   const r = await fetch(url, { method: 'GET' });
+  if (!r.ok) throw new Error(`GAS HTTP ${r.status}`);
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || 'GAS error');
   return j;
 }
 
-// ---------------- Basic health & debug ----------------
-app.get('/health', (_req, res) => res.json({ ok:true, uptime: process.uptime() }));
-app.get('/__routes', (_req, res) => {
-  const routes = [];
-  app._router.stack.forEach((m) => {
-    if (m.route && m.route.path) {
-      const methods = Object.keys(m.route.methods).map(x => x.toUpperCase());
-      routes.push({ methods, path: m.route.path });
-    }
-  });
-  res.json({ ok:true, routes });
-});
+// ---- health ----
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ---------------- Friendly test endpoints -------------
-app.get('/search', requireHeaderKey, async (req, res) => {
+// ---- friendly GET endpoints ----
+app.get('/search', requireKey, async (req, res) => {
   try {
     const { q = '', max = 5 } = req.query;
     const data = await gasCall('search', { q, max });
-    res.json({ ok:true, data });
+    res.json({ ok: true, data });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-app.get('/fetch', requireHeaderKey, async (req, res) => {
+app.get('/fetch', requireKey, async (req, res) => {
   try {
     const { id, lines } = req.query;
     if (!id) return res.status(400).json({ ok:false, error:'Missing id' });
     const data = await gasCall('fetch', { id, lines });
-    res.json({ ok:true, data });
+    res.json({ ok: true, data });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// ---------------- MCP: SSE endpoint -------------------
-// GET /mcp?token=...    (Accept: text/event-stream)
-app.get('/mcp', requireTokenQuery, (req, res) => {
-  const acceptsSSE = (req.get('accept') || '').includes('text/event-stream');
+// ---- MCP over HTTP (SSE + JSON-RPC) ----
 
-  // Helpful message if you hit it in a browser
-  if (!acceptsSSE) {
-    return res
-      .status(200)
-      .json({ ok:false, hint: 'This is an SSE endpoint. Use Accept: text/event-stream. For JSON-RPC use POST /mcp/messages.' });
+// SSE "hello": tells the client where to POST JSON-RPC messages
+app.get('/mcp', (req, res) => {
+  const token = String(req.query.token || '');
+  if (!token || token !== BRIDGE_API_KEY) {
+    res.status(401).end('unauthorized');
+    return;
   }
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const base = `${req.protocol}://${req.get('host')}`;
-  const endpoint = `${base}/mcp/messages?token=${encodeURIComponent(req.query.token)}`;
-
-  // Send the required "endpoint" event so the client knows where to POST JSON-RPC
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  // Tell the client which endpoint to use for JSON-RPC
+  const endpoint = `/mcp/messages?token=${encodeURIComponent(token)}`;
   res.write(`event: endpoint\n`);
   res.write(`data: ${JSON.stringify({ url: endpoint })}\n\n`);
 
-  // Keep-alive ping (optional)
-  const timer = setInterval(() => res.write('event: ping\ndata: {}\n\n'), 15000);
+  // keep-alive pings
+  const timer = setInterval(() => res.write(`: ping\n\n`), 25000);
   req.on('close', () => clearInterval(timer));
 });
 
-// ---------------- MCP: JSON-RPC endpoint --------------
-app.post('/mcp/messages', requireTokenQuery, express.json(), async (req, res) => {
+// JSON-RPC messages
+app.post('/mcp/messages', async (req, res) => {
   try {
-    const msg = req.body || {};
-    const { id = null, method = '', params = {} } = msg;
-
-    const respond = (result) => res.json({ jsonrpc: '2.0', id, result });
-    const err = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
+    const token = String(req.query.token || '');
+    if (!token || token !== BRIDGE_API_KEY) {
+      return res.status(401).json({ jsonrpc:'2.0', id: null, error:{ code:401, message:'unauthorized' }});
+    }
+    const { jsonrpc, id, method, params } = req.body || {};
+    if (jsonrpc !== '2.0') {
+      return res.status(400).json({ jsonrpc:'2.0', id, error:{ code:-32600, message:'Invalid Request' }});
+    }
 
     if (method === 'initialize') {
-      return respond({
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: { list: true, call: true } }
-      });
+      return res.json({ jsonrpc:'2.0', id, result:{ protocolVersion:'2024-11-05' }});
     }
 
     if (method === 'tools/list') {
-      return respond({
-        tools: [
-          { name: 'drive_search', description: 'Search Drive by title/filters', inputSchema: { type:'object', properties: { q:{type:'string'}, max:{type:'number'} } } },
-          { name: 'drive_fetch',  description: 'Fetch a Drive file by id',       inputSchema: { type:'object', properties: { id:{type:'string'}, lines:{type:'number'} } } }
-        ]
+      return res.json({
+        jsonrpc:'2.0',
+        id,
+        result:{
+          tools:[
+            { name:'drive_search', description:'Search Drive by title/filters', inputSchema:{ q:'string', max:'number' } },
+            { name:'drive_fetch',  description:'Fetch a Drive file by id',       inputSchema:{ id:'string', lines:'number?' } }
+          ]
+        }
       });
     }
 
     if (method === 'tools/call') {
-      const { name, arguments: args = {} } = params;
+      const { name, arguments: args = {} } = params || {};
       if (name === 'drive_search') {
         const { q = '', max = 5 } = args;
         const data = await gasCall('search', { q, max });
-        return respond({ content: data });
+        return res.json({ jsonrpc:'2.0', id, result:{ content:data }});
       }
       if (name === 'drive_fetch') {
-        const { id, lines } = args;
-        if (!id) return err(-32602, 'Missing id');
-        const data = await gasCall('fetch', { id, lines });
-        return respond({ content: data });
+        const { id: fid, lines } = args;
+        if (!fid) {
+          return res.json({ jsonrpc:'2.0', id, error:{ code:-32602, message:'Missing id'}});
+        }
+        const data = await gasCall('fetch', { id: fid, lines });
+        return res.json({ jsonrpc:'2.0', id, result:{ content:data }});
       }
-      return err(-32601, `Unknown tool: ${name}`);
+      return res.json({ jsonrpc:'2.0', id, error:{ code:-32601, message:'Unknown tool'}});
     }
 
-    return err(-32601, `Unknown method: ${method}`);
-  } catch (e) {
-    return res.json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: { code: -32000, message: String(e.message || e) } });
+    return res.json({ jsonrpc:'2.0', id, error:{ code:-32601, message:'Unknown method'}});
+  } catch (err) {
+    return res.status(500).json({ jsonrpc:'2.0', id: null, error:{ code:-32000, message:String(err?.message || err) }});
   }
 });
 
-// --------------- start server (Render needs 0.0.0.0) ---
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`YFL bridge listening on http://0.0.0.0:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`YFL bridge listening on http://localhost:${PORT}`);
 });
