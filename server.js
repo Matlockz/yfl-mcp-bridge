@@ -1,79 +1,158 @@
-// server.js — YFL MCP Bridge (stateless)
-// Express HTTP endpoint `/mcp` that ChatGPT can call via api_tool.
-// Tools: drive_search, drive_fetch. No interactive prompts, ever.
-
+// server.mjs
+import 'dotenv/config';
 import express from 'express';
-import fetch from 'node-fetch';
+import cors from 'cors';
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const GAS_BASE = process.env.GAS_BASE;                // e.g., https://script.google.com/macros/s/.../exec
-const TK = process.env.GDRIVE_TEXT_TOKEN;             // must match Apps Script TOKEN
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';  // optional: used only for your own bookkeeping
+// ---- env ----
+const PORT = process.env.PORT || 3332;
+const GAS_BASE_URL = process.env.GAS_BASE_URL;   // e.g. https://script.google.com/.../exec
+const GAS_KEY      = process.env.GAS_KEY;        // your Apps Script shared key
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY; // your local/connector shared key
 
-if (!GAS_BASE || !TK) {
-  console.error('Missing GAS_BASE or GDRIVE_TEXT_TOKEN env vars.');
-  process.exit(1);
+// ---- guards ----
+function requireHeaderKey(req, res, next) {
+  const k = req.header('x-api-key') || req.query.api_key;
+  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
+  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid x-api-key' });
+  next();
+}
+function requireTokenQuery(req, res, next) {
+  const t = req.query.token || req.query.tk || '';
+  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
+  if (t !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid token' });
+  next();
 }
 
-// Simple health
-app.get('/', (_, res) => res.json({ ok: true, name: 'yfl-mcp-bridge', ts: Date.now() }));
+// ---- Apps Script call helper ----
+async function gasCall(action, params) {
+  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
+  const url = new URL(GAS_BASE_URL);
+  url.searchParams.set('action', action);
+  url.searchParams.set('key', GAS_KEY);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  const r = await fetch(url, { method: 'GET' });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'GAS error');
+  return j;
+}
 
-// 1) List tools (non-interactive)
-app.post('/mcp', async (req, res) => {
+// ---------------- Basic health & debug ----------------
+app.get('/health', (_req, res) => res.json({ ok:true, uptime: process.uptime() }));
+app.get('/__routes', (_req, res) => {
+  const routes = [];
+  app._router.stack.forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods).map(x => x.toUpperCase());
+      routes.push({ methods, path: m.route.path });
+    }
+  });
+  res.json({ ok:true, routes });
+});
+
+// ---------------- Friendly test endpoints -------------
+app.get('/search', requireHeaderKey, async (req, res) => {
   try {
-    const body = req.body || {};
-    const { op, name, args } = body;
+    const { q = '', max = 5 } = req.query;
+    const data = await gasCall('search', { q, max });
+    res.json({ ok:true, data });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
 
-    // Handshake: list available operations
-    if (!op || op === 'list') {
-      return res.json({
-        ok: true,
-        name: 'YFL MCP Bridge',
-        interactive: false,
+app.get('/fetch', requireHeaderKey, async (req, res) => {
+  try {
+    const { id, lines } = req.query;
+    if (!id) return res.status(400).json({ ok:false, error:'Missing id' });
+    const data = await gasCall('fetch', { id, lines });
+    res.json({ ok:true, data });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// ---------------- MCP: SSE endpoint -------------------
+// GET /mcp?token=...    (Accept: text/event-stream)
+app.get('/mcp', requireTokenQuery, (req, res) => {
+  const acceptsSSE = (req.get('accept') || '').includes('text/event-stream');
+
+  // Helpful message if you hit it in a browser
+  if (!acceptsSSE) {
+    return res
+      .status(200)
+      .json({ ok:false, hint: 'This is an SSE endpoint. Use Accept: text/event-stream. For JSON-RPC use POST /mcp/messages.' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const base = `${req.protocol}://${req.get('host')}`;
+  const endpoint = `${base}/mcp/messages?token=${encodeURIComponent(req.query.token)}`;
+
+  // Send the required "endpoint" event so the client knows where to POST JSON-RPC
+  res.write(`event: endpoint\n`);
+  res.write(`data: ${JSON.stringify({ url: endpoint })}\n\n`);
+
+  // Keep-alive ping (optional)
+  const timer = setInterval(() => res.write('event: ping\ndata: {}\n\n'), 15000);
+  req.on('close', () => clearInterval(timer));
+});
+
+// ---------------- MCP: JSON-RPC endpoint --------------
+app.post('/mcp/messages', requireTokenQuery, express.json(), async (req, res) => {
+  try {
+    const msg = req.body || {};
+    const { id = null, method = '', params = {} } = msg;
+
+    const respond = (result) => res.json({ jsonrpc: '2.0', id, result });
+    const err = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
+
+    if (method === 'initialize') {
+      return respond({
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: { list: true, call: true } }
+      });
+    }
+
+    if (method === 'tools/list') {
+      return respond({
         tools: [
-          {
-            name: 'drive_search',
-            interactive: false,
-            args_schema: { type: 'object', properties: { q: { type: 'string' }, max: { type: 'number' } }, required: ['q'] }
-          },
-          {
-            name: 'drive_fetch',
-            interactive: false,
-            args_schema: { type: 'object', properties: { id: { type: 'string' }, lines: { type: 'number' } }, required: ['id'] }
-          }
+          { name: 'drive_search', description: 'Search Drive by title/filters', inputSchema: { type:'object', properties: { q:{type:'string'}, max:{type:'number'} } } },
+          { name: 'drive_fetch',  description: 'Fetch a Drive file by id',       inputSchema: { type:'object', properties: { id:{type:'string'}, lines:{type:'number'} } } }
         ]
       });
     }
 
-    // 2) Call tool
-    if (op === 'call' && name === 'drive_search') {
-      const q = (args?.q || '').trim();
-      const max = Number(args?.max || 10);
-      const url = `${GAS_BASE}/drive_search?q=${encodeURIComponent(q)}&max=${max}&tk=${encodeURIComponent(TK)}`;
-      const r = await fetch(url);
-      const data = await r.json();
-      return res.json({ ok: true, result: data });
+    if (method === 'tools/call') {
+      const { name, arguments: args = {} } = params;
+      if (name === 'drive_search') {
+        const { q = '', max = 5 } = args;
+        const data = await gasCall('search', { q, max });
+        return respond({ content: data });
+      }
+      if (name === 'drive_fetch') {
+        const { id, lines } = args;
+        if (!id) return err(-32602, 'Missing id');
+        const data = await gasCall('fetch', { id, lines });
+        return respond({ content: data });
+      }
+      return err(-32601, `Unknown tool: ${name}`);
     }
 
-    if (op === 'call' && name === 'drive_fetch') {
-      const id = (args?.id || '').trim();
-      const lines = Number(args?.lines || 0);
-      const url = `${GAS_BASE}/drive_fetch?id=${encodeURIComponent(id)}${lines ? `&lines=${lines}` : ''}&tk=${encodeURIComponent(TK)}`;
-      const r = await fetch(url);
-      const data = await r.json();
-      return res.json({ ok: true, result: data });
-    }
-
-    return res.status(400).json({ ok: false, error: 'unknown_op_or_tool', body });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: String(err) });
+    return err(-32601, `Unknown method: ${method}`);
+  } catch (e) {
+    return res.json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: { code: -32000, message: String(e.message || e) } });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`YFL MCP Bridge listening on :${PORT} (POST /mcp)`);
+// --------------- start server (Render needs 0.0.0.0) ---
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`YFL bridge listening on http://0.0.0.0:${PORT}`);
 });
