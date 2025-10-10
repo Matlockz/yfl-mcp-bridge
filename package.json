@@ -4,7 +4,9 @@
   "type": "module",
   "private": true,
   "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
