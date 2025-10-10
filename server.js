@@ -34,6 +34,52 @@ app.use((req, res, next) => {
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// --- Add near top ---
+async function gasJson(url, attempt = 1) {
+  const r = await fetch(url, { redirect: 'follow' });
+  const text = await r.text();
+
+  // If Apps Script returns the Google login page, that's an auth misconfig.
+  // Detect by 'accounts.google.com' in HTML and throw a clean error.
+  if (text.includes('accounts.google.com')) {
+    throw new Error('Apps Script requires login (web app not deployed as "Anyone").');
+  }
+
+  // Try to parse JSON; if not JSON, raise error with a snippet.
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (attempt < 2 && (r.status >= 500 || r.status === 429)) {
+      await new Promise(res => setTimeout(res, 400));
+      return gasJson(url, attempt + 1);
+    }
+    throw new Error(`Unexpected non‑JSON from GAS (status ${r.status}).`);
+  }
+}
+
+// --- In callTool(), replace the two fetches with gasJson(...):
+
+// search / drive_search
+if (name === 'search' || name === 'drive_search') {
+  const q   = args?.q ?? '';
+  const max = Number(args?.max ?? 25);
+  const url = `${GAS_BASE_URL}/api/search?q=${encodeURIComponent(q)}&max=${max}&token=${encodeURIComponent(GAS_KEY)}`;
+  const j   = await gasJson(url);
+  return [{ type: 'json', json: j?.data ?? j }];
+}
+
+// fetch / drive_fetch
+if (name === 'fetch' || name === 'drive_fetch') {
+  const id    = String(args?.id ?? '');
+  const lines = args?.lines ?? '';
+  if (!id) return [{ type: 'text', text: 'Missing "id" argument.' }];
+  const url = `${GAS_BASE_URL}/api/fetch?id=${encodeURIComponent(id)}${lines?`&lines=${lines}`:''}&token=${encodeURIComponent(GAS_KEY)}`;
+  const j   = await gasJson(url);
+  if (j?.data?.inline && j?.data?.text) return [{ type:'text', text: j.data.text }];
+  return [{ type: 'json', json: j?.data ?? j }];
+}
+
+
 // ---------- small helper ----------
 async function fetchJsonOrText(url) {
   const r = await fetch(url, { headers: { 'Cache-Control': 'no-cache' } });
