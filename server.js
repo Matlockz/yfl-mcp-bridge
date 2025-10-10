@@ -15,9 +15,8 @@ const PROTOCOL       = process.env.MCP_PROTOCOL || '2024-11-05';
 // ---------- app ----------
 const app = express();
 
-// Tell Express to respect X-Forwarded-* so req.protocol reflects HTTPS behind a proxy
-// (Render/Cloudflare set X-Forwarded-Proto: https)
-app.set('trust proxy', true); // <— IMPORTANT
+// IMPORTANT: we’re behind Render’s proxy. This makes req.protocol honor X-Forwarded-Proto.
+app.set('trust proxy', true); // so req.protocol becomes "https" on Render.  ← FIX
 
 // CORS: allow ChatGPT (and fall back to *)
 const ALLOW_ORIGINS = new Set([
@@ -27,15 +26,17 @@ const ALLOW_ORIGINS = new Set([
   'http://localhost:5173',
   'http://localhost:3000',
 ]);
+
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  res.setHeader('Vary', 'Origin');
   if (origin && ALLOW_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  // Allow MCP headers so preflight passes.
   res.setHeader(
     'Access-Control-Allow-Headers',
     'Content-Type,MCP-Protocol-Version,MCP-Client,X-Requested-With,Authorization'
@@ -51,9 +52,13 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ---------- simple REST probes (protected by x-api-key) ----------
 const requireKey = (req, res, next) => {
-  if (!BRIDGE_API_KEY) return res.status(500).json({ ok: false, error: 'missing BRIDGE_API_KEY' });
+  if (!BRIDGE_API_KEY) {
+    return res.status(500).json({ ok: false, error: 'missing BRIDGE_API_KEY' });
+  }
   const k = req.headers['x-api-key'];
-  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  if (k !== BRIDGE_API_KEY) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
   next();
 };
 
@@ -81,10 +86,11 @@ const ok  = (id, result)                   => ({ jsonrpc: '2.0', id, result });
 const err = (id, code, message, data=null) => ({ jsonrpc: '2.0', id, error: { code, message, data } });
 
 function listTools() {
-  // Mark tools read-only so ChatGPT won’t block them in non-interactive turns
+  // Mark tools read-only so ChatGPT won’t block them in non-interactive turns.
   const annotations = { readOnlyHint: true, openWorldHint: true };
 
   return [
+    // Canonical names:
     {
       name: 'search',
       description: 'Search Google Drive by file title.',
@@ -97,7 +103,7 @@ function listTools() {
       inputSchema: { type: 'object', properties: { id: { type: 'string' }, lines: { type: 'number' } } },
       annotations
     },
-    // Back-compat aliases
+    // Back-compat aliases:
     {
       name: 'drive_search',
       description: 'Search Google Drive by file title.',
@@ -144,40 +150,48 @@ async function handleMcp(req, res) {
     if (method === 'initialize') {
       return res.json(ok(id, { protocolVersion: PROTOCOL, capabilities: { tools: {} } }));
     }
+
     if (method === 'tools/list') {
       return res.json(ok(id, { tools: listTools() }));
     }
+
     if (method === 'tools/call') {
       const { name, arguments: args } = params || {};
       const content = await callTool(name, args || {});
       return res.json(ok(id, { content }));
     }
+
     return res.json(err(id ?? null, -32601, 'Unknown method'));
   } catch (e) {
     return res.json(err(req.body?.id ?? null, -32000, String(e?.message || e), { stack: e?.stack }));
   }
 }
 
-// Single endpoint style (spec-compliant): GET = SSE, POST = JSON-RPC
+// POST /mcp  (messages endpoint)
 app.post('/mcp', handleMcp);
-app.post('/mcp/messages', handleMcp); // backward-compat for older probes
 
-// SSE discovery — MUST advertise an HTTPS messages URI per MCP Streamable HTTP spec
+// also accept legacy messages path if you need it
+app.post('/mcp/messages', handleMcp);
+
+// Minimal GET /mcp SSE for discovery/keepalive
 app.get('/mcp', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8'); // SSE content type
   res.setHeader('Cache-Control', 'no-cache');
 
-  // Prefer x-forwarded-proto, then req.protocol; default to https
-  const xfProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const proto   = xfProto || req.protocol || 'https';
-  const host    = req.get('host');
-  const tokenQs = req.query.token ? `?token=${encodeURIComponent(String(req.query.token))}` : '';
-  const messagesUrl = `${proto}://${host}/mcp${tokenQs}`;
+  // Build a correct absolute URL for the messages endpoint.
+  const host = req.get('host') || '';
+  const isLocal = /^localhost(?::\d+)?$/.test(host);
+  const protoFromHeader = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim().toLowerCase();
+  const scheme = isLocal ? 'http' : (protoFromHeader || req.protocol || 'https'); // https on Render
 
-  res.write('event: endpoint\n');
-  res.write(`data: ${JSON.stringify({ messages: messagesUrl })}\n\n`);
+  const base = `${scheme}://${host}`;
+  const endpoint = `${base}/mcp`; // this server’s messages endpoint
 
-  const t = setInterval(() => res.write(': keepalive\n\n'), 30000);
+  res.write(`event: endpoint\n`);
+  res.write(`data: ${JSON.stringify({ messages: endpoint })}\n\n`);
+
+  // Keep the connection alive
+  const t = setInterval(() => res.write(': keepalive\n\n'), 30000); // SSE "comment" keepalive
   req.on('close', () => clearInterval(t));
 });
 
