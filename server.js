@@ -1,21 +1,21 @@
-// YFL MCP Bridge — Streamable HTTP transport + Apps Script proxy (ESM)
+// YFL MCP Bridge — HTTP transport + Apps Script proxy
+// ESM syntax, Node >=18
 
-// ---------------- imports ----------------
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
 // ---------------- env ----------------
-const PORT = process.env.PORT || 10000;  // Render injects 10000
+const PORT = process.env.PORT || 10000;        // Render will inject 10000
 const GAS_BASE_URL = process.env.GAS_BASE_URL || '';
-const GAS_KEY      = process.env.GAS_KEY || '';
+const GAS_KEY = process.env.GAS_KEY || '';
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '';
 const PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 
 // ---------------- app ----------------
 const app = express();
 
-// CORS: allow ChatGPT (and fall back to `*`)
+// CORS: allow ChatGPT (and fall back to *)
 const ALLOW_ORIGINS = new Set([
   'https://chat.openai.com',
   'https://chatgpt.com',
@@ -29,210 +29,206 @@ app.use((req, res, next) => {
   if (origin && ALLOW_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Origin', '*'); // safe for this bridge; tighten later if desired
   }
   res.setHeader('Vary', 'Origin');
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET,POST,OPTIONS'
-  );
-  // Let preflights include the MCP header
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
     'Content-Type,MCP-Protocol-Version,MCP-Client,X-Requested-With,Authorization'
   );
   res.setHeader('Access-Control-Expose-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// ---------------- utilities ----------------
-function ensureEnv() {
-  if (!GAS_BASE_URL || !GAS_KEY) {
-    throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
-  }
+// ---- helpers ---------------------------------------------------
+function authMcp(req) {
+  // token comes on the query string:  /mcp?token=...
+  const t = (req.query.token || '').toString();
+  if (!BRIDGE_API_KEY) return { ok: false, code: 500, msg: 'Server missing BRIDGE_API_KEY' };
+  if (!t || t !== BRIDGE_API_KEY) return { ok: false, code: 401, msg: 'Invalid or missing token' };
+  return { ok: true };
 }
 
-async function gasCall(action, params = {}) {
-  ensureEnv();
-  const url = new URL(GAS_BASE_URL);
-  url.searchParams.set('action', action);
-  url.searchParams.set('key', GAS_KEY);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) {
-      url.searchParams.set(k, String(v));
-    }
-  }
-  const r = await fetch(url, { method: 'GET' });
-  const j = await r.json();
-  if (!j?.ok) throw new Error(j?.error || 'GAS error');
-  return j; // shape: { ok:true, data:{ ok:true, data:{ … } } }
-}
-
-// JSON-RPC helpers
-function jsonrpc(id, result) {
+function jsonrpcOk(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
 function jsonrpcErr(id, code, message, data) {
-  const e = { code, message };
-  if (data !== undefined) e.data = data;
-  return { jsonrpc: '2.0', id, error: e };
+  return { jsonrpc: '2.0', id, error: { code, message, data } };
 }
 
-// ---------------- health ----------------
-app.get('/health', (_req, res) => {
-  res.type('application/json').send(JSON.stringify({ ok: true }));
-});
+async function gasCall(action, params) {
+  if (!GAS_BASE_URL || !GAS_KEY) {
+    throw new Error('Server missing GAS_BASE_URL or GAS_KEY');
+  }
+  const url = new URL(GAS_BASE_URL);
+  url.searchParams.set('action', action);
+  url.searchParams.set('key', GAS_KEY);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  const r = await fetch(url, { method: 'GET' });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'GAS error');
+  return j.data || j; // Apps Script wrapper returns { ok, data: {...} }
+}
 
-// ---------------- friendly GETs (manual smoke tests) ----------------
+// ---- health ----------------------------------------------------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ---- simple REST (debug smoke tests) ---------------------------
 function requireKey(req, res, next) {
   const k = req.header('x-api-key') || req.query.api_key;
-  if (!BRIDGE_API_KEY) return res.status(500).json({ ok:false, error:'Server missing BRIDGE_API_KEY' });
-  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok:false, error:'Missing or invalid x-api-key' });
+  if (!BRIDGE_API_KEY) return res.status(500).json({ ok: false, error: 'Server missing BRIDGE_API_KEY' });
+  if (k !== BRIDGE_API_KEY) return res.status(401).json({ ok: false, error: 'Missing or invalid x-api-key' });
   next();
 }
 
 app.get('/search', requireKey, async (req, res) => {
   try {
     const { q = '', max = 5 } = req.query;
-    const out = await gasCall('search', { q, max });
-    res.json({ ok: true, data: out });
+    const data = await gasCall('search', { q, max });
+    res.json({ ok: true, data });
   } catch (e) {
-    res.status(500).json({ ok:false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
 app.get('/fetch', requireKey, async (req, res) => {
   try {
     const { id, lines } = req.query;
-    if (!id) return res.status(400).json({ ok:false, error:'Missing id' });
-    const out = await gasCall('fetch', { id, lines });
-    res.json({ ok: true, data: out });
+    if (!id) return res.status(400).json({ ok: false, error: 'Missing id' });
+    const data = await gasCall('fetch', { id, lines });
+    res.json({ ok: true, data });
   } catch (e) {
-    res.status(500).json({ ok:false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ---------------- MCP: SSE handshake (Streamable HTTP) ----------------
-// GET /mcp?token=...
+// ---- MCP Streamable HTTP --------------------------------------
+// GET /mcp  -> SSE that returns the URL to post JSON-RPC messages
 app.get('/mcp', (req, res) => {
-  // Very light token check (keeps randoms away). Add anything stronger if you want.
-  const tk = req.query.token;
-  if (!tk || typeof tk !== 'string') {
-    // JSON‑RPC error code parity (unknown method vs invalid request)
-    // Here it's a plain HTTP error since this is the SSE handshake.
-    return res.status(400).send('Missing token');
-  }
+  const a = authMcp(req);
+  if (!a.ok) return res.status(a.code).end(a.msg);
 
-  // SSE headers
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  // SSE setup
+  res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  // tell client where to POST JSON-RPC messages
-  const endpoint = new URL(req.protocol + '://' + req.get('host') + '/mcp/messages');
-  endpoint.searchParams.set('token', tk);
+  const base = `${req.protocol}://${req.get('host')}`;
+  const messages = `${base}/mcp/messages?token=${encodeURIComponent(req.query.token)}`;
+
   res.write(`event: endpoint\n`);
-  res.write(`data: ${JSON.stringify({ messages: endpoint.toString() })}\n\n`);
+  res.write(`data: ${JSON.stringify({ messages })}\n\n`);
+  const keepalive = setInterval(() => res.write(`: keepalive\n\n`), 25000);
 
-  // keepalive
-  const iv = setInterval(() => {
-    res.write(`: keepalive\n\n`);
-  }, 15000);
-
-  req.on('close', () => clearInterval(iv));
+  req.on('close', () => clearInterval(keepalive));
 });
 
-// ---------------- MCP: single POST endpoint for JSON-RPC ----------------
+// POST /mcp/messages -> JSON-RPC 2.0 requests
 app.post('/mcp/messages', async (req, res) => {
+  const a = authMcp(req);
+  if (!a.ok) return res.status(a.code).json({ ok: false, error: a.msg });
+
   try {
-    const proto = req.header('MCP-Protocol-Version') || PROTOCOL;
-    if (!proto) return res.status(400).json({ error: 'Missing MCP-Protocol-Version' });
+    const { id, method, params = {} } = req.body || {};
+    if (!id) return res.json(jsonrpcErr(null, -32600, 'Missing id'));
+    if (!method) return res.json(jsonrpcErr(id, -32601, 'Missing method'));
 
-    const { jsonrpc: v, id, method, params } = req.body || {};
-    if (v !== '2.0') return res.json(jsonrpcErr(id ?? null, -32600, 'Invalid Request')); // JSON-RPC 2.0
-
-    // initialize
+    // ---- initialize (MCP lifecycle)
     if (method === 'initialize') {
-      return res.json(jsonrpc(id, { protocolVersion: PROTOCOL }));
-    }
-
-    // tools/list
-    if (method === 'tools/list') {
+      // MCP requires the server to report supported capabilities
+      // Include tools capability so ChatGPT registers our tools.
       return res.json(
-        jsonrpc(id, {
-          tools: [
-            {
-              name: 'drive_search',
-              description: 'Search Drive by title',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  q: { type: 'string' },
-                  max: { type: 'number' }
-                }
-              }
-            },
-            {
-              name: 'drive_fetch',
-              description: 'Fetch Drive file by id',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  id: { type: 'string' },
-                  lines: { type: 'number' }
-                }
-              }
-            }
-          ]
+        jsonrpcOk(id, {
+          protocolVersion: PROTOCOL,
+          capabilities: {
+            tools: { listChanged: true }
+          },
+          serverInfo: { name: 'yfl-mcp-bridge', version: '1.0.0' }
         })
       );
     }
 
-    // tools/call
+    // ---- tools/list (include annotations so ChatGPT can treat them as READ)
+    if (method === 'tools/list') {
+      const tools = [
+        {
+          name: 'drive_search',
+          description: 'Search Drive by title',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              q: { type: 'string' },
+              max: { type: 'number' }
+            }
+          },
+          // <<< IMPORTANT >>> mark read-only so ChatGPT doesn’t gate it as WRITE
+          annotations: {
+            readOnlyHint: true,
+            idempotentHint: true
+          }
+        },
+        {
+          name: 'drive_fetch',
+          description: 'Fetch a Drive file by id',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              lines: { type: 'number' }
+            }
+          },
+          annotations: {
+            readOnlyHint: true,
+            idempotentHint: true
+          }
+        }
+      ];
+      return res.json(jsonrpcOk(id, { tools }));
+    }
+
+    // ---- tools/call
     if (method === 'tools/call') {
-      const { name, arguments: args = {} } = params || {};
+      const { name, arguments: args = {} } = params;
       if (name === 'drive_search') {
-        const q = args.q ?? '';
-        const max = args.max ?? 5;
-        const out = await gasCall('search', { q, max });
-        // out shape: { ok:true, data:{ ok:true, data:{ query,count,files[] } } }
-        const files = out?.data?.data ?? null;
+        const { q = '', max = 5 } = args;
+        const data = await gasCall('search', { q, max });
         return res.json(
-          jsonrpc(id, {
-            content: [{ type: 'json', json: files }]
+          jsonrpcOk(id, {
+            content: [{ type: 'json', json: data }]
           })
         );
       }
       if (name === 'drive_fetch') {
-        const idArg = args.id;
-        const lines = args.lines;
-        if (!idArg) {
-          return res.json(jsonrpcErr(id ?? null, -32602, 'Missing id'));
-        }
-        const out = await gasCall('fetch', { id: idArg, lines });
-        // If GAS returns inline text, expose as type:text. Otherwise bubble the json.
-        const payload = out?.data?.data ?? null;
-        if (payload?.inline && typeof payload?.text === 'string') {
-          return res.json(
-            jsonrpc(id, { content: [{ type: 'text', text: payload.text }] })
-          );
-        }
-        return res.json(
-          jsonrpc(id, { content: [{ type: 'json', json: payload }] })
-        );
+        const { id: fileId, lines } = args;
+        if (!fileId) return res.json(jsonrpcErr(id, -32602, 'Missing id'));
+        const data = await gasCall('fetch', { id: fileId, lines });
+        // If GAS returned inline text, surface as text; else surface JSON
+        const payload =
+          data && data.data && data.data.inline && typeof data.data.text === 'string'
+            ? [{ type: 'text', text: data.data.text }]
+            : [{ type: 'json', json: data }];
+        return res.json(jsonrpcOk(id, { content: payload }));
       }
-      return res.json(jsonrpcErr(id ?? null, -32601, 'Unknown tool')); // JSON-RPC "Method not found" :contentReference[oaicite:2]{index=2}
+      return res.json(jsonrpcErr(id, -32601, 'Unknown tool'));
     }
 
-    // unknown method
-    return res.json(jsonrpcErr(id ?? null, -32601, 'Unknown method')); // JSON-RPC 2.0 :contentReference[oaicite:3]{index=3}
+    return res.json(jsonrpcErr(id, -32601, 'Unknown method'));
   } catch (err) {
     return res.json(jsonrpcErr(req.body?.id ?? null, -32000, 'Internal error', String(err?.message || err)));
   }
+});
+
+// (Optional convenience) also accept direct POST /mcp for JSON-RPC
+app.post('/mcp', async (req, res) => {
+  req.url = '/mcp/messages' + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+  app._router.handle(req, res);
 });
 
 // ---------------- start ----------------
