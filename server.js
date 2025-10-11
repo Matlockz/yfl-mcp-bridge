@@ -132,7 +132,8 @@ async function handleMcp(req, res) {
       return res.json(jsonrpcOk(id, {
         protocolVersion: PROTOCOL,
         serverInfo: { name: 'yfl-mcp-bridge', version: '1.0.0' },
-        capabilities: { tools: {} },
+        // Important for picky clients — declare tools capability
+        capabilities: { tools: { listChanged: true } },
       }));
     }
 
