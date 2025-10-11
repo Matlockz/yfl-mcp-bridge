@@ -6,7 +6,7 @@ import 'dotenv/config';
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS: allow ChatGPT web origin and common headers, including MCP-Protocol-Version
+// CORS (allow MCP headers used by the ChatGPT web app)
 app.use(cors({
   origin: true,
   methods: ['GET','POST','OPTIONS'],
@@ -19,7 +19,7 @@ app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
 
 const PORT       = process.env.PORT || 10000;
-const GAS_BASE   = process.env.GAS_BASE_URL || process.env.GAS_BASE; // e.g. https://script.google.com/macros/s/.../exec
+const GAS_BASE   = process.env.GAS_BASE_URL || process.env.GAS_BASE;
 const GAS_KEY    = process.env.GAS_KEY || process.env.BRIDGE_TOKEN || process.env.TOKEN || process.env.BRIDGE_API_KEY;
 const PROTOCOL   = process.env.MCP_PROTOCOL || '2024-11-05';
 const BRIDGE_KEY = process.env.BRIDGE_API_KEY || process.env.BRIDGE_TOKEN || process.env.TOKEN;
@@ -55,7 +55,7 @@ function listTools() {
       }, ['id']),
       annotations: { title: 'Drive Fetch', readOnlyHint: true, openWorldHint: true },
     },
-    // convenient aliases (some clients expect simple names)
+    // aliases some clients prefer:
     {
       name: 'search',
       description: 'Alias of drive_search.',
@@ -108,7 +108,6 @@ async function callTool(name, args = {}) {
     const j = await gasCall('fetch', { id, lines, binary });
     const d = j?.data ?? j;
     if (!binary && d && typeof d.text === 'string') {
-      // return text content directly if provided by backend
       return [{ type: 'text', text: d.text }];
     }
     return [{ type: 'json', json: d }];
@@ -119,7 +118,6 @@ async function callTool(name, args = {}) {
 
 async function handleMcp(req, res) {
   try {
-    // Optional: simple token gate if env set (used by your connector URL)
     if (BRIDGE_KEY) {
       const tok = req.query.token || req.header('X-Bridge-Token');
       if (tok !== BRIDGE_KEY) {
@@ -132,7 +130,7 @@ async function handleMcp(req, res) {
       return res.json(jsonrpcOk(id, {
         protocolVersion: PROTOCOL,
         serverInfo: { name: 'yfl-mcp-bridge', version: '1.0.0' },
-        // Important for picky clients — declare tools capability
+        // ➜ Important for MCP tools declaration
         capabilities: { tools: { listChanged: true } },
       }));
     }
@@ -177,15 +175,11 @@ app.get('/fetch', async (req, res) => {
   }
 });
 
-// ---------- MCP endpoint (Streamable HTTP + SSE discovery) ----------
-
-// POST: JSON‑RPC messages
+// ---------- MCP endpoint (Streamable HTTP + legacy SSE discovery) ----------
 app.post('/mcp', handleMcp);
-app.post('/mcp/messages', handleMcp); // backward‑compat for older tests
+app.post('/mcp/messages', handleMcp);
 
-// GET: SSE discovery/keepalive (older 2024-11-05 flow; harmless for 2025 flow)
 app.get('/mcp', (req, res) => {
-  // Only emit SSE when the client asks for it.
   if (!String(req.headers.accept || '').includes('text/event-stream')) {
     return res.status(405).send('Use POST for JSON‑RPC. To open SSE, request with Accept: text/event-stream.');
   }
@@ -193,7 +187,6 @@ app.get('/mcp', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
 
-  // Instruct client to POST to the same URL it used, preserving query (e.g., ?token=...)
   const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
   res.write(`event: endpoint\n`);
   res.write(`data: ${JSON.stringify({ url: fullUrl })}\n\n`);
