@@ -7,7 +7,7 @@ app.set('trust proxy', true);
 
 // ---- ENV (use Render Environment or .env for local dev)
 const TOKEN        = process.env.TOKEN        || 'Wt8UPTyKNKRGTUQ24NzU';
-const GAS_BASE_URL = process.env.GAS_BASE_URL || 'https://script.google.com/macros/s/AKfycby2ssdVE-VgxqbzdZO3jGHDF3YsEf4vguBFF6hJVbzWsuO-0hh_GTcmRMW_Gqr1-Md8/exec';
+const GAS_BASE_URL = process.env.GAS_BASE_URL || 'https://script.google.com/macros/s/AKfycbxP3FvJS2e4i3k_AhiUzeO58zr4F2YYoGU5YFeONz1VxYWwvef2v6EKSBKx5RJNwxfwaQ/exec';
 const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 const DEBUG        = String(process.env.DEBUG || '0') !== '0';
 
