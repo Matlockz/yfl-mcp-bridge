@@ -1,12 +1,13 @@
 {
-  "name": "yfl-mcp-drive-bridge",
+  "name": "yfl-mcp-bridge",
   "version": "3.3.1",
-  "type": "module",
-  "engines": { "node": ">=18.18.0" },
+  "private": true,
+  "description": "MCP bridge for YFL Google Drive Apps Script",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2"
