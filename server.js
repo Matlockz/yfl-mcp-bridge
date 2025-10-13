@@ -24,7 +24,7 @@ async function gasGet(path, params = {}) {
   if (!GAS_BASE) throw new Error('GAS_BASE_URL missing');
   if (!GAS_KEY)  throw new Error('GAS token missing');
 
-  const url = new URL(GAS_BASE + '/' + path.replace(/^\//, ''));
+  const url = `${GAS_BASE_URL}?${qp.toString()}`;
   url.searchParams.set('token', GAS_KEY);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
