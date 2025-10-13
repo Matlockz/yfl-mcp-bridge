@@ -1,101 +1,198 @@
-// server.js — yfl-mcp-bridge (query-param routing to GAS)
+// server.js — YFL Drive Bridge MCP bridge (v3.3.1, spec-safe)
+// Node >= 18 (uses global fetch). CommonJS for simplicity.
 
-import express from 'express';
-import fetch from 'node-fetch';
-import cors from 'cors';
-import compression from 'compression';
+const express = require('express');
+const cors = require('cors');
 
 const app = express();
-app.use(compression());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', true);
 
-const PORT         = process.env.PORT || 3000;
-const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
-const GAS_KEY      = process.env.GAS_KEY || process.env.BRIDGE_API_KEY || '';
-const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, ''); // must be .../exec
-const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
+// ----- ENV -----
+const PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
+const GAS_BASE  = (process.env.GAS_BASE_URL || '').replace(/\/+$/, '');
+const GAS_KEY   = process.env.GAS_KEY || process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || process.env.BRIDGE_APIKEY || '';
 
-function badEnv(msg) {
-  return { ok: false, error: msg };
+// ----- Helpers -----
+function json(res, code, obj) {
+  res.status(code).set('Cache-Control', 'no-store').json(obj);
 }
 
-async function gasGet(params) {
-  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS_BASE_URL / GAS_KEY missing');
-  const qp = new URLSearchParams({ ...params, token: GAS_KEY });
-  const url = `${GAS_BASE_URL}?${qp.toString()}`;
-  const r = await fetch(url, { method: 'GET' });
-  const ct = r.headers.get('content-type') || '';
-  const txt = await r.text();
-  if (!ct.includes('application/json')) {
-    // health wants to detect sign-in HTML
-    return { ok: false, error: `GAS returned non-JSON (${r.status} ${ct}) — first 200 chars: ${txt.slice(0, 200)}` };
+async function gasGet(path, params = {}) {
+  if (!GAS_BASE) throw new Error('GAS_BASE_URL missing');
+  if (!GAS_KEY)  throw new Error('GAS token missing');
+
+  const url = new URL(GAS_BASE + '/' + path.replace(/^\//, ''));
+  url.searchParams.set('token', GAS_KEY);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
-  try {
-    return JSON.parse(txt);
-  } catch (e) {
-    return { ok: false, error: `GAS JSON parse error: ${e.message}`, raw: txt };
+
+  const r = await fetch(url.toString(), { method: 'GET' });
+  const ctype = (r.headers.get('content-type') || '').toLowerCase();
+
+  if (!ctype.includes('application/json')) {
+    const t = await r.text();
+    // Common failure: Google sign-in HTML if Apps Script deploy isn’t public
+    const head = t.slice(0, 200);
+    const msg = `GAS returned non-JSON (${r.status} ${ctype}) — first 200 chars: ${head}`;
+    const err = new Error(msg);
+    err.status = 424;
+    err.nonJson = true;
+    throw err;
   }
+
+  const body = await r.json();
+  if (!body || body.ok === false) {
+    const msg = (body && body.error) ? String(body.error) : 'GAS returned ok:false';
+    const err = new Error(msg);
+    err.status = 424;
+    throw err;
+  }
+  return body; // { ok:true, data: ... } or { ok:true }
 }
 
-// --- health
+// MCP tool result helpers (spec-safe)
+function okText(text) {
+  return { content: [{ type: 'text', text }], isError: false };
+}
+function errText(message) {
+  return { content: [{ type: 'text', text: message }], isError: true };
+}
+
+// ----- Health -----
 app.get('/health', async (req, res) => {
   try {
-    const out = await gasGet({ action: 'health' });
-    res.json({ ok: !!out.ok, protocol: MCP_PROTOCOL, gas: !!out.ok, gas_detail: out });
+    const body = await gasGet('api/health');
+    return json(res, 200, { ok: true, protocol: PROTOCOL, gas: true });
   } catch (e) {
-    res.status(424).json({ ok: false, error: String(e) });
+    const code = e.status || 424;
+    const error = String(e.message || e);
+    return json(res, code, { ok: false, error, gas: false });
   }
 });
 
-// --- MCP endpoints (minimal)
+// ----- SSE endpoint discovery (optional) -----
+app.get('/mcp', (req, res) => {
+  const accept = (req.headers['accept'] || '').toLowerCase();
+  if (!accept.includes('text/event-stream')) {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    return res.status(200).send('Use POST for JSON-RPC. To open SSE, request with Accept: text/event-stream.');
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const endpoint = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  res.write(`event: endpoint\n`);
+  res.write(`data: ${JSON.stringify({ url: endpoint })}\n\n`);
+  const t = setInterval(() => res.write(`: keepalive\n\n`), 30_000);
+  req.on('close', () => clearInterval(t));
+});
+
+// ----- JSON-RPC (MCP) -----
 app.post('/mcp', async (req, res) => {
-  const auth = String(req.query.token || '');
-  if (!TOKEN || auth !== TOKEN) return res.status(401).json({ error: 'unauthorized' });
-
-  const body = req.body || {};
-  const { id, method, params } = body;
-
-  const reply = (result) => res.json({ jsonrpc: '2.0', id, result });
-  const error = (msg)   => res.json({ jsonrpc: '2.0', id, error: { code: -32000, message: msg } });
-
   try {
+    const { id, method, params } = req.body || {};
+
     if (method === 'initialize') {
-      return reply({ protocolVersion: MCP_PROTOCOL, serverInfo: { name: 'yfl-drive-bridge', version: '3.3.2' },
-                     capabilities: { tools: { listChanged: true } } });
+      return json(res, 200, {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          protocolVersion: PROTOCOL,
+          serverInfo: { name: 'yfl-drive-bridge', version: '3.3.1' },
+          capabilities: { tools: { listChanged: true } }
+        }
+      });
     }
+
     if (method === 'tools/list') {
-      return reply({ tools: [
-        { name: 'search',      description: 'Search Google Drive by filename (contains).',
-          inputSchema: { type: 'object', required: ['q'], properties: { q: { type: 'string' }, max: { type: 'integer', minimum: 1, maximum: 100, default: 5 } } } },
-        { name: 'fetch',       description: 'Fetch by file id; inline text when possible, else JSON metadata.',
-          inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, lines: { type: 'integer', minimum: 0, maximum: 1000000, default: 200 } } } },
-        { name: 'drive_search', description: 'Alias of search', inputSchema: { type: 'object', required: ['q'], properties: { q: { type: 'string' }, max: { type: 'integer', default: 5 } } } },
-        { name: 'drive_fetch',  description: 'Alias of fetch',  inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, lines: { type: 'integer', default: 200 } } } }
-      ]});
+      return json(res, 200, {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          tools: [
+            {
+              name: 'search',
+              description: 'Search Google Drive by filename (contains).',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  q:   { type: 'string', description: 'substring to match in filename' },
+                  max: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+                  mode:{ type: 'string', enum: ['name', 'content'], description: 'optional; currently name-only' }
+                },
+                required: ['q']
+              }
+            },
+            {
+              name: 'fetch',
+              description: 'Fetch by file id; inline text when possible, else JSON metadata.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  id:    { type: 'string' },
+                  lines: { type: 'integer', minimum: 0, maximum: 1000000, default: 0 }
+                },
+                required: ['id']
+              }
+            },
+            { name: 'drive_search', description: 'Alias of search', inputSchema: { type: 'object', properties: { q:{type:'string'}, max:{type:'integer'} }, required:['q'] } },
+            { name: 'drive_fetch',  description: 'Alias of fetch',  inputSchema: { type: 'object', properties: { id:{type:'string'}, lines:{type:'integer'} }, required:['id'] } }
+          ]
+        }
+      });
     }
+
     if (method === 'tools/call') {
       const name = params?.name;
       const args = params?.arguments || {};
-      if (name === 'search' || name === 'drive_search') {
-        if (!args.q) return reply({ content: [{ type: 'text', text: 'q is required' }], isError: true });
-        const out = await gasGet({ action: 'search', q: args.q, max: String(args.max ?? 5) });
-        if (!out.ok) return reply({ content: [{ type: 'text', text: out.error || 'search failed' }], isError: true });
-        return reply({ content: [{ type: 'json', json: out.data }], isError: false });
+
+      try {
+        if (name === 'search' || name === 'drive_search') {
+          const q   = String(args.q || '').trim();
+          const max = Math.max(1, Math.min(parseInt(args.max ?? 25, 10) || 25, 100));
+          if (!q) return json(res, 200, { jsonrpc: '2.0', id, result: errText('q is required') });
+
+          const body = await gasGet('api/search', { q, max });
+          const payload = body.data || body; // {query,count,files}
+          return json(res, 200, { jsonrpc: '2.0', id, result: okText(JSON.stringify(payload, null, 2)) });
+        }
+
+        if (name === 'fetch' || name === 'drive_fetch') {
+          const idArg  = String(args.id || '').trim();
+          const lines  = Math.max(0, Math.min(parseInt(args.lines ?? 0, 10) || 0, 1000000));
+          if (!idArg) return json(res, 200, { jsonrpc: '2.0', id, result: errText('id is required') });
+
+          const body = await gasGet('api/fetch', { id: idArg, lines });
+          const payload = body.data || body;
+          // If GAS delivered inline text, send text; else JSON
+          if (payload && payload.inline && typeof payload.text === 'string') {
+            return json(res, 200, { jsonrpc: '2.0', id, result: okText(payload.text) });
+          }
+          return json(res, 200, { jsonrpc: '2.0', id, result: okText(JSON.stringify(payload, null, 2)) });
+        }
+
+        return json(res, 200, { jsonrpc: '2.0', id, result: errText(`unknown tool: ${name}`) });
+
+      } catch (e) {
+        const msg = String(e.message || e);
+        return json(res, 200, { jsonrpc: '2.0', id, result: errText(msg) });
       }
-      if (name === 'fetch' || name === 'drive_fetch') {
-        if (!args.id) return reply({ content: [{ type: 'text', text: 'id is required' }], isError: true });
-        const out = await gasGet({ action: 'fetch', id: args.id, lines: String(args.lines ?? 200) });
-        if (!out.ok) return reply({ content: [{ type: 'text', text: out.error || 'fetch failed' }], isError: true });
-        return reply({ content: [{ type: 'json', json: out.data }], isError: false });
-      }
-      return error('unknown tool');
     }
 
-    return error('unknown method');
-  } catch (e) {
-    return error(String(e));
+    // Unknown method
+    return json(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+
+  } catch (err) {
+    return json(res, 500, { jsonrpc: '2.0', error: { code: -32603, message: String(err?.message || err) } });
   }
 });
 
-app.listen(PORT, () => console.log(`yfl-mcp-bridge listening on :${PORT}`));
+// ----- Start -----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`yfl-drive-bridge listening on ${PORT}`);
+});
