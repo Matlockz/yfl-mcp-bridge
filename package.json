@@ -1,10 +1,10 @@
 {
   "name": "yfl-mcp-bridge",
-  "version": "3.6.0",
+  "version": "3.4.1",
   "type": "module",
-  "engines": { "node": ">=18.17" },
+  "engines": { "node": ">=18" },
   "scripts": {
-    "start": "node server.js",
+    "start": "node server.mjs",
     "dev": "node server.mjs"
   },
   "dependencies": {
