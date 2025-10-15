@@ -1,15 +1,9 @@
-// server.js — YFL Drive Bridge (CommonJS)
+// YFL MCP Drive Bridge (local) — server.mjs
+// Node 18+ (ESM). No dotenv/node-fetch required.
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-
-async function doFetch(url, opts) {
-  if (global.fetch) return await global.fetch(url, opts); // Node 18+
-  const { default: f } = await import('node-fetch');
-  return await f(url, opts);
-}
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
 
 const app = express();
 app.set('trust proxy', true);
@@ -21,111 +15,114 @@ const PORT         = process.env.PORT || 10000;
 const TOKEN        = process.env.BRIDGE_TOKEN || process.env.TOKEN || '';
 const GAS_BASE_URL = process.env.GAS_BASE_URL || '';
 const GAS_KEY      = process.env.GAS_KEY || '';
-const PROTOCOL     = process.env.MCP_PROTOCOL || '2024-11-05';
+const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 const DEBUG        = String(process.env.DEBUG || '0') === '1';
 
-function u(action, params = {}) {
-  const url = new URL(GAS_BASE_URL);
-  url.searchParams.set('action', action);
-  url.searchParams.set('token', GAS_KEY);
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null) continue;
-    url.searchParams.append(k, String(v));
-  }
-  return url.toString();
+function requireToken(req, res, next) {
+  const t = String(req.query.token || req.get('X-Bridge-Token') || '').trim();
+  if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
+  next();
 }
 
-async function getFromGAS(action, params = {}) {
-  const url = u(action, params);
-  const r = await doFetch(url, { redirect: 'follow' });
+async function getGas(path) {
+  if (!GAS_BASE_URL) throw new Error('GAS_BASE_URL missing');
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${GAS_BASE_URL}${path}${sep}token=${encodeURIComponent(GAS_KEY)}`;
+  const r = await fetch(url, { redirect: 'manual' });
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (!ct.includes('application/json')) {
-    const text = await r.text();
-    throw new Error(
-      `GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${text.slice(0, 200)}`
-    );
+    const first = await r.text();
+    throw new Error(`GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${first.slice(0,200)}`);
   }
   return await r.json();
 }
 
-function requireBridgeToken(req, res, next) {
-  const t = (req.query.token || req.get('X-Bridge-Token') || '').trim();
-  if (!TOKEN) return next();
-  if (t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
-  next();
+function qs(obj = {}) {
+  return Object.entries(obj)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
 }
 
-app.get('/health', async (_req, res) => {
+// --- Health
+app.get('/health', async (req, res) => {
   try {
-    const ok = await getFromGAS('health');
-    return res.json({ ok: true, protocol: PROTOCOL, gas: !!(ok && ok.ok) });
+    const h = await getGas('/api/health');
+    res.json({ ok: true, protocol: MCP_PROTOCOL, gas: !!(h && h.ok), ts: new Date().toISOString() });
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.status(424).json({ ok: false, gas: false, error: String(e?.message || e), base: GAS_BASE_URL });
+    res.status(424).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
-app.get('/tools/list', async (_req, res) => {
+// --- REST fallbacks (handy for shell tests)
+app.get('/tools/list', requireToken, async (req, res) => {
   try {
-    const out = await getFromGAS('tools/list');
-    return res.json(out);
+    let out;
+    try { out = await getGas('/api/tools/list'); }
+    catch { out = await getGas('/?action=tools/list'); } // older GAS builds
+    res.json(out);
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.status(424).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
-app.post('/tools/call', async (req, res) => {
+app.post('/tools/call', requireToken, async (req, res) => {
   try {
-    const name = String(req.body?.name || '').trim();
-    const args = req.body?.arguments || {};
+    const { name, arguments: args = {} } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-
-    const out = await getFromGAS('tools/call', { name, ...args });
-    return res.json(out);
+    let out;
+    try { out = await getGas(`/api/tools/call?name=${encodeURIComponent(name)}&${qs(args)}`); }
+    catch { out = await getGas(`/?action=tools/call&name=${encodeURIComponent(name)}&${qs(args)}`); }
+    res.json(out);
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.status(424).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
-app.post('/mcp', requireBridgeToken, async (req, res) => {
-  const { jsonrpc, id, method, params = {} } = req.body || {};
+// --- MCP (Streamable HTTP / JSON-RPC)
+app.post('/mcp', requireToken, async (req, res) => {
+  const { id, method, params = {} } = req.body || {};
   try {
     if (method === 'initialize') {
       return res.json({
         jsonrpc: '2.0',
         id,
         result: {
-          protocolVersion: PROTOCOL,
+          protocolVersion: MCP_PROTOCOL,
           serverInfo: { name: 'yfl-drive-bridge', version: '3.4.0' },
           capabilities: { tools: { listChanged: true } }
         }
       });
     }
     if (method === 'tools/list') {
-      const out = await getFromGAS('tools/list');
-      return res.json({ jsonrpc: '2.0', id, result: out });
+      let out;
+      try { out = await getGas('/api/tools/list'); }
+      catch { out = await getGas('/?action=tools/list'); }
+      const tools = (out.tools || []).map(t => ({
+        name: t.name,                      // keep original names (drive.list, drive.search, drive.get)
+        description: t.description,
+        inputSchema: t.input_schema || t.inputSchema || { type: 'object' }
+      }));
+      return res.json({ jsonrpc: '2.0', id, result: { tools } });
     }
     if (method === 'tools/call') {
-      const name = params?.name;
-      const args = params?.arguments || {};
-      if (!name) {
-        return res.json({ jsonrpc: '2.0', id, error: { code: -32602, message: 'name is required' } });
-      }
-      const out = await getFromGAS('tools/call', { name, ...args });
+      const name = params.name;
+      const args = params.arguments || {};
+      if (!name) return res.json({ jsonrpc: '2.0', id, error: { code: -32602, message: 'name is required' } });
+      let out;
+      try { out = await getGas(`/api/tools/call?name=${encodeURIComponent(name)}&${qs(args)}`); }
+      catch { out = await getGas(`/?action=tools/call&name=${encodeURIComponent(name)}&${qs(args)}`); }
       return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'json', json: out }], isError: false } });
     }
     return res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: `unknown method: ${method}` } });
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.json({
-      jsonrpc: '2.0',
-      id,
-      result: { content: [{ type: 'text', text: String(e?.message || e) }], isError: true }
-    });
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true } });
   }
 });
 
-app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
+app.get('/', (req, res) => res.send('YFL MCP Drive Bridge is running.'));
 app.listen(PORT, () => console.log(`YFL MCP Bridge on :${PORT}`));
