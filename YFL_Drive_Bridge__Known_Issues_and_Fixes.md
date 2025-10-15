@@ -59,3 +59,16 @@ _Last updated: YYYY‑MM‑DD_
 `Invoke‑RestMethod -Uri "http://localhost:10000/health"`
 
 **Tools list (REST, with header token)**  
+$H = @{ "X-Bridge-Token" = $env:TOKEN }
+Invoke‑RestMethod -Headers $H -Uri "http://localhost:10000/tools/list" | ConvertTo‑Json -Depth 6
+
+yaml
+Copy code
+
+**Inspector (HTTP/S)**  
+`npx @modelcontextprotocol/inspector --connect "http://localhost:10000/mcp?token=$env:TOKEN"`【 :contentReference[oaicite:20]{index=20}】
+
+---
+
+## Changelog
+- 2025‑10‑15: Logged repeated 302 issues from transcripts and added dual‑path `/?action=` fallback reference.
