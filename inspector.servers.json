@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "yfl-local": {
+      "type": "streamable-http",
+      "url": "http://localhost:10000/mcp?token=v3c3NJQ4i94"
+    }
+  }
+}
