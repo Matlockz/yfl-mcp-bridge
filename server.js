@@ -1,186 +1,194 @@
-// YFL MCP Drive Bridge 3.4.1  (ESM / Node 18+)
-// - No dotenv required. Reads process.env directly.
-// - Proxies GAS "action" endpoints and exposes REST + MCP over streamable HTTP.
+// server.mjs — YFL Drive Bridge (Node 18+ / ESM)
 
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 
 const app = express();
-
-// CORS for ChatGPT + Inspector
-const ALLOW_ORIGINS = [
-  'https://chat.openai.com',
-  'https://chatgpt.com',
-  'http://localhost:6274', // MCP Inspector
-  'http://127.0.0.1:6274',
-];
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(null, true); // permissive for local testing
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'X-Bridge-Token',
-      'Authorization',
-      'MCP-Protocol-Version',
-    ],
-  }),
-);
+app.set('trust proxy', true);
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-const PORT = process.env.PORT || 10000;
-const TOKEN = process.env.BRIDGE_TOKEN || process.env.TOKEN || '';
-const GAS_BASE_URL = String(process.env.GAS_BASE_URL || '').replace(/\/$/, ''); // no trailing slash
-const GAS_KEY = process.env.GAS_KEY || process.env.SHARED_KEY || '';
+// ---- env
+const PORT         = process.env.PORT || 10000;
+const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
+const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, ''); // .../exec
+const GAS_KEY      = process.env.GAS_KEY || '';
 const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
-const DEBUG = String(process.env.DEBUG || '0') === '1';
+const DEBUG        = String(process.env.DEBUG || '0') === '1';
 
+// ---- tiny helpers
 function requireToken(req, res, next) {
-  const hdrAuth = (req.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-  const provided =
-    (req.query.token || req.get('X-Bridge-Token') || hdrAuth || '').trim();
-
-  if (!TOKEN) return res.status(401).json({ ok: false, error: 'token not configured on server' });
-  if (provided !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
-  return next();
+  const t = (req.query.token || req.get('X-Bridge-Token') || '').trim();
+  if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
+  next();
 }
 
-function qs(obj) {
-  return Object.entries(obj)
-    .filter(([, v]) => v !== undefined && v !== null && v !== '')
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join('&');
-}
-
-// --- low-level call into GAS using your proven ?action=... API
-async function gasAction(action, params = {}) {
-  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS_BASE_URL or GAS_KEY missing');
-  const url = `${GAS_BASE_URL}?action=${encodeURIComponent(action)}&${qs({
-    ...params,
-    token: GAS_KEY,
-  })}`;
-
-  const r = await fetch(url, { redirect: 'manual' });
-  const ct = (r.headers.get('content-type') || '').toLowerCase();
-
-  if (!ct.includes('application/json')) {
-    const text = await r.text();
-    throw new Error(
-      `GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${text.slice(
-        0,
-        200,
-      )}`,
-    );
+// Build a proper Apps Script URL:
+//   kind = 'action' | 'path'
+//   value = e.g. 'tools/list' or '/api/health'
+//   extra = plain object of extra query params
+function gasURL(kind, value, extra = {}) {
+  const u = new URL(GAS_BASE_URL);
+  u.searchParams.set(kind, value);
+  u.searchParams.set('token', GAS_KEY);
+  for (const [k, v] of Object.entries(extra)) {
+    if (v === undefined || v === null) continue;
+    u.searchParams.set(k, String(v));
   }
-  return await r.json();
+  return u.toString();
 }
 
-// ---------------- REST proxies (used by smoke tests) ----------------
+async function fetchJSON(url) {
+  // Follow redirects from ContentService (302 to googleusercontent)
+  const r = await fetch(url, { redirect: 'follow' });
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  const text = await r.text();
+  // Some GAS deployments send "text/plain" with JSON body. Try to parse regardless.
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (DEBUG) console.error('[GAS non-JSON]', r.status, ct, text.slice(0, 200));
+    throw new Error(`GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${text.slice(0,200)}`);
+  }
+}
 
+// ---------------- REST passthrough tools ----------------
+
+// Health: calls your GAS /api/health
 app.get('/health', async (req, res) => {
   try {
-    const body = await gasAction('health');
-    return res.json({ ok: true, gas: !!(body && body.ok), ts: body.ts || new Date().toISOString() });
+    if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS_BASE_URL or GAS_KEY missing');
+    const out = await fetchJSON(gasURL('path', '/api/health'));
+    return res.json({ ok: true, protocol: MCP_PROTOCOL, gas: !!(out && out.ok), ts: out.ts || null });
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res
-      .status(424)
-      .json({ ok: false, error: String((e && e.message) || e) });
+    return res.status(424).json({ ok: false, gas: false, error: String(e && e.message || e) });
   }
 });
 
+// List tools as defined by your GAS script (drive.list, drive.search, drive.get)
 app.get('/tools/list', requireToken, async (req, res) => {
   try {
-    const body = await gasAction('tools/list');
-    return res.json(body);
+    const out = await fetchJSON(gasURL('action', 'tools/list'));
+    return res.json(out);
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.status(502).json({ ok: false, error: String((e && e.message) || e) });
+    return res.status(502).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
+// Call a tool by name, forwarding arguments.
+// Accept body { name: string, arguments: object } (same shape you used in curl/PowerShell)
 app.post('/tools/call', requireToken, async (req, res) => {
   try {
     const { name, arguments: args = {} } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    const body = await gasAction('tools/call', { name, ...args });
-    return res.json(body);
+    // We forward as GET with query params (your GAS handler accepts this form)
+    const out = await fetchJSON(gasURL('action', 'tools/call', { name, ...args }));
+    return res.json(out);
   } catch (e) {
     if (DEBUG) console.error(e);
-    return res.status(502).json({ ok: false, error: String((e && e.message) || e) });
+    return res.status(502).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
-// also support GET /tools/call?name=... for quick testing
-app.get('/tools/call', requireToken, async (req, res) => {
-  try {
-    const { name, ...args } = req.query || {};
-    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    const body = await gasAction('tools/call', { name, ...args });
-    return res.json(body);
-  } catch (e) {
-    if (DEBUG) console.error(e);
-    return res.status(502).json({ ok: false, error: String((e && e.message) || e) });
-  }
-});
-
-// ---------------- MCP (streamable HTTP) endpoint ----------------
+// ---------------- MCP (streamable HTTP over JSON-RPC) ----------------
 
 app.post('/mcp', requireToken, async (req, res) => {
-  const { id, method, params = {} } = req.body || {};
+  const send = (id, resultOrError) => {
+    if (resultOrError && resultOrError.error) {
+      return res.json({ jsonrpc: '2.0', id, error: resultOrError.error });
+    }
+    return res.json({ jsonrpc: '2.0', id, result: resultOrError });
+  };
 
   try {
+    const { jsonrpc, id, method, params = {} } = req.body || {};
+
     if (method === 'initialize') {
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          protocolVersion: MCP_PROTOCOL,
-          serverInfo: { name: 'yfl-drive-bridge', version: '3.4.1' },
-          capabilities: { tools: { listChanged: true } },
-        },
+      return send(id, {
+        protocolVersion: MCP_PROTOCOL,
+        serverInfo: { name: 'yfl-drive-bridge', version: '3.5.0' },
+        capabilities: { tools: { listChanged: true } }
       });
     }
 
     if (method === 'tools/list') {
-      const out = await gasAction('tools/list');
-      const tools = (out.tools || []).map((t) => ({
-        name: t.name,
-        description: t.description,
-        // GAS returns input_schema; MCP expects inputSchema
-        inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
-      }));
-      return res.json({ jsonrpc: '2.0', id, result: { tools } });
+      // Provide a minimal MCP tool surface (aliases for your Drive tools).
+      return send(id, {
+        tools: [
+          {
+            name: 'drive.search',
+            description: 'Search files with DriveApp (v2 query syntax).',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string' },
+                limit: { type: 'integer', minimum: 1, maximum: 200, default: 25 }
+              },
+              required: ['query']
+            }
+          },
+          {
+            name: 'drive.list',
+            description: 'List files in a folder by path or folderId.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                folderPath: { type: 'string' },
+                folderId: { type: 'string' },
+                limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 }
+              }
+            }
+          },
+          {
+            name: 'drive.get',
+            description: 'Get file metadata by id (Drive v3).',
+            inputSchema: {
+              type: 'object',
+              properties: { id: { type: 'string' } },
+              required: ['id']
+            }
+          }
+        ]
+      });
     }
 
     if (method === 'tools/call') {
       const { name, arguments: args = {} } = params;
-      if (!name)
-        return res.json({ jsonrpc: '2.0', id, error: { code: -32602, message: 'name is required' } });
-      const out = await gasAction('tools/call', { name, ...args });
-      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'json', json: out }], isError: false } });
+      if (!name) return send(id, { error: { code: -32602, message: 'name is required' } });
+
+      try {
+        const out = await fetchJSON(gasURL('action', 'tools/call', { name, ...args }));
+        return send(id, {
+          content: [{ type: 'json', json: out }],
+          isError: false
+        });
+      } catch (e) {
+        if (DEBUG) console.error(e);
+        return send(id, {
+          content: [{ type: 'text', text: String(e && e.message || e) }],
+          isError: true
+        });
+      }
     }
 
-    return res.json({
-      jsonrpc: '2.0',
-      id,
-      error: { code: -32601, message: `unknown method: ${method}` },
-    });
+    return send(id, { error: { code: -32601, message: `unknown method: ${method}` } });
   } catch (e) {
     if (DEBUG) console.error(e);
     return res.json({
       jsonrpc: '2.0',
-      id,
-      result: { content: [{ type: 'text', text: String((e && e.message) || e) }], isError: true },
+      id: (req.body && req.body.id) || null,
+      result: { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true }
     });
   }
 });
 
-app.get('/', (req, res) => res.send('YFL MCP Drive Bridge is running.'));
-app.listen(PORT, () => console.log(`YFL MCP Bridge listening on :${PORT}`));
+// Root
+app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
+
+app.listen(PORT, () => {
+  console.log(`YFL MCP Bridge listening on :${PORT}`);
+});
