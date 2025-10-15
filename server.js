@@ -1,5 +1,5 @@
-// YFL Drive Bridge – MCP proxy for Google Apps Script
-// Node >= 18 (ESM). No dotenv required.
+// Identical to server.mjs, kept as .js for deployment convenience.
+// Node >= 18 with "type": "module" in package.json.
 
 import express from 'express';
 import cors from 'cors';
@@ -57,7 +57,6 @@ async function gas(action, params = {}) {
   return await r.json();
 }
 
-// --- health
 app.get('/health', async (_req, res) => {
   try {
     const ok = await gas('health');
@@ -68,15 +67,9 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// --- REST smoke tests (protected)
 app.get('/tools/list', requireToken, async (_req, res) => {
-  try {
-    const out = await gas('tools/list');
-    res.json(out);
-  } catch (e) {
-    if (DEBUG) console.error('tools/list:', e);
-    res.status(424).json({ ok: false, error: String(e?.message || e) });
-  }
+  try { const out = await gas('tools/list'); res.json(out); }
+  catch (e) { if (DEBUG) console.error('tools/list:', e); res.status(424).json({ ok: false, error: String(e?.message || e) }); }
 });
 
 app.post('/tools/call', requireToken, async (req, res) => {
@@ -91,7 +84,6 @@ app.post('/tools/call', requireToken, async (req, res) => {
   }
 });
 
-// --- MCP JSON-RPC (Inspector / ChatGPT Connectors)
 app.post('/mcp', requireToken, async (req, res) => {
   try {
     const { id, method, params = {} } = req.body || {};
@@ -113,7 +105,6 @@ app.post('/mcp', requireToken, async (req, res) => {
       const tools = (raw?.tools || []).map(t => ({
         name: t.name,
         description: t.description || '',
-        // GAS uses input_schema; MCP expects inputSchema
         inputSchema: t.inputSchema || t.input_schema || { type: 'object' }
       }));
       return res.json({ jsonrpc: '2.0', id, result: { tools } });
