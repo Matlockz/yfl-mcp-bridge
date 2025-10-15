@@ -1,4 +1,5 @@
-// server.mjs — YFL Drive Bridge (Node 18+ / ESM)
+// server.js — YFL Drive Bridge (Node 18+ / ESM)
+// Same as server.mjs so Render/GitHub use .js with "type":"module"
 
 import express from 'express';
 import cors from 'cors';
@@ -10,29 +11,23 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-// ---- env
 const PORT         = process.env.PORT || 10000;
 const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
-const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, ''); // .../exec
+const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, '');
 const GAS_KEY      = process.env.GAS_KEY || '';
 const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 const DEBUG        = String(process.env.DEBUG || '0') === '1';
 
-// ---- tiny helpers
 function requireToken(req, res, next) {
   const t = (req.query.token || req.get('X-Bridge-Token') || '').trim();
   if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
   next();
 }
 
-// Build a proper Apps Script URL:
-//   kind = 'action' | 'path'
-//   value = e.g. 'tools/list' or '/api/health'
-//   extra = plain object of extra query params
 function gasURL(kind, value, extra = {}) {
   const u = new URL(GAS_BASE_URL);
   u.searchParams.set(kind, value);
-  u.searchParams.set('token', GAS_KEY);
+  u.searchParams.set('token', process.env.GAS_KEY || '');
   for (const [k, v] of Object.entries(extra)) {
     if (v === undefined || v === null) continue;
     u.searchParams.set(k, String(v));
@@ -41,11 +36,9 @@ function gasURL(kind, value, extra = {}) {
 }
 
 async function fetchJSON(url) {
-  // Follow redirects from ContentService (302 to googleusercontent)
   const r = await fetch(url, { redirect: 'follow' });
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   const text = await r.text();
-  // Some GAS deployments send "text/plain" with JSON body. Try to parse regardless.
   try {
     return JSON.parse(text);
   } catch {
@@ -54,10 +47,7 @@ async function fetchJSON(url) {
   }
 }
 
-// ---------------- REST passthrough tools ----------------
-
-// Health: calls your GAS /api/health
-app.get('/health', async (req, res) => {
+app.get('/health', async (_req, res) => {
   try {
     if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS_BASE_URL or GAS_KEY missing');
     const out = await fetchJSON(gasURL('path', '/api/health'));
@@ -68,8 +58,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// List tools as defined by your GAS script (drive.list, drive.search, drive.get)
-app.get('/tools/list', requireToken, async (req, res) => {
+app.get('/tools/list', requireToken, async (_req, res) => {
   try {
     const out = await fetchJSON(gasURL('action', 'tools/list'));
     return res.json(out);
@@ -79,13 +68,10 @@ app.get('/tools/list', requireToken, async (req, res) => {
   }
 });
 
-// Call a tool by name, forwarding arguments.
-// Accept body { name: string, arguments: object } (same shape you used in curl/PowerShell)
 app.post('/tools/call', requireToken, async (req, res) => {
   try {
     const { name, arguments: args = {} } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    // We forward as GET with query params (your GAS handler accepts this form)
     const out = await fetchJSON(gasURL('action', 'tools/call', { name, ...args }));
     return res.json(out);
   } catch (e) {
@@ -93,8 +79,6 @@ app.post('/tools/call', requireToken, async (req, res) => {
     return res.status(502).json({ ok: false, error: String(e && e.message || e) });
   }
 });
-
-// ---------------- MCP (streamable HTTP over JSON-RPC) ----------------
 
 app.post('/mcp', requireToken, async (req, res) => {
   const send = (id, resultOrError) => {
@@ -105,7 +89,7 @@ app.post('/mcp', requireToken, async (req, res) => {
   };
 
   try {
-    const { jsonrpc, id, method, params = {} } = req.body || {};
+    const { id, method, params = {} } = req.body || {};
 
     if (method === 'initialize') {
       return send(id, {
@@ -116,7 +100,6 @@ app.post('/mcp', requireToken, async (req, res) => {
     }
 
     if (method === 'tools/list') {
-      // Provide a minimal MCP tool surface (aliases for your Drive tools).
       return send(id, {
         tools: [
           {
@@ -159,25 +142,16 @@ app.post('/mcp', requireToken, async (req, res) => {
     if (method === 'tools/call') {
       const { name, arguments: args = {} } = params;
       if (!name) return send(id, { error: { code: -32602, message: 'name is required' } });
-
       try {
         const out = await fetchJSON(gasURL('action', 'tools/call', { name, ...args }));
-        return send(id, {
-          content: [{ type: 'json', json: out }],
-          isError: false
-        });
+        return send(id, { content: [{ type: 'json', json: out }], isError: false });
       } catch (e) {
-        if (DEBUG) console.error(e);
-        return send(id, {
-          content: [{ type: 'text', text: String(e && e.message || e) }],
-          isError: true
-        });
+        return send(id, { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true });
       }
     }
 
     return send(id, { error: { code: -32601, message: `unknown method: ${method}` } });
   } catch (e) {
-    if (DEBUG) console.error(e);
     return res.json({
       jsonrpc: '2.0',
       id: (req.body && req.body.id) || null,
@@ -186,9 +160,5 @@ app.post('/mcp', requireToken, async (req, res) => {
   }
 });
 
-// Root
 app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
-
-app.listen(PORT, () => {
-  console.log(`YFL MCP Bridge listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`YFL MCP Bridge listening on :${PORT}`));
