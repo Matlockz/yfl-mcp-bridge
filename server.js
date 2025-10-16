@@ -5,39 +5,61 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 
+// ------------------------------
+// Defaults (overridable via env)
+// ------------------------------
+const DEFAULT_GAS_BASE_URL =
+  'https://script.google.com/macros/s/AKfycbzK3N03phivSJsZasvRmhPwYlaS4gFCnR-pvxUmUWZpihXJOaucg5Lw249lZA9vC5p0ZA/exec';
+const DEFAULT_KEY = 'v3c3NJQ4i94'; // SHARED_KEY and bridge token default
+
+// ------------------------------
+// Env
+// ------------------------------
+const PORT         = process.env.PORT || 10000;
+const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || DEFAULT_KEY;
+const GAS_BASE_URL = (process.env.GAS_BASE_URL || DEFAULT_GAS_BASE_URL).replace(/\/+$/, '');
+const GAS_KEY      = process.env.GAS_KEY || DEFAULT_KEY;
+const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
+const DEBUG        = String(process.env.DEBUG || '0') === '1';
+
+// ------------------------------
+// App wiring
+// ------------------------------
 const app = express();
 app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-// ---- Env
-const PORT         = process.env.PORT || 10000;
-const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
-const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, '');
-const GAS_KEY      = process.env.GAS_KEY || '';
-const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
-const DEBUG        = String(process.env.DEBUG || '0') === '1';
-
-// ---- Auth for bridge (header or query)
+// ------------------------------
+// Bridge auth (header or ?token)
+// ------------------------------
 function requireToken(req, res, next) {
   const q  = (req.query.token || '').trim();
   const hd = (req.get('X-Bridge-Token') || '').trim();
   const t  = hd || q;
-  if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok:false, error:'bad token' });
+  if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
   return next();
 }
 
-// Add near your other helpers
-const mapToolsReadOnly = (tools = []) =>
-  tools.map(t => ({
+// -------------------------------------------
+// Helper: mark tools read-only for the client
+// -------------------------------------------
+function mapToolsReadOnly(tools = []) {
+  return tools.map(t => ({
     name: t.name,
     description: t.description,
     inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
-    annotations: { readOnlyHint: true }     // <-- key line (MCP spec)
+    // Important: hint to clients that these are non-mutating read-only actions.
+    // MCP tool annotations are an extension point recognized by clients. 
+    // See MCP "tool annotations" docs (readOnlyHint). 
+    annotations: { readOnlyHint: true }
   }));
+}
 
-// ---- GAS helper (action style) with 302 follow
+// ------------------------------------------------------
+// GAS call helper (action style) with one 302 follow
+// ------------------------------------------------------
 async function gasAction(action, params = {}) {
   if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
 
@@ -48,14 +70,14 @@ async function gasAction(action, params = {}) {
   }
   const url = `${GAS_BASE_URL}?${usp.toString()}`;
 
-  // 1st request (don’t auto-follow so we can diagnose)
-  let r = await fetch(url, { redirect: 'manual' });
+  // First request (don’t auto-follow so we can diagnose redirects)
+  let r = await fetch(url, { redirect: 'manual', headers: { 'accept': 'application/json' } });
 
-  // If ContentService redirected to script.googleusercontent.com, follow once
+  // Apps Script Web Apps often 302 to script.googleusercontent.com
   if ((r.status === 302 || r.status === 303) && r.headers.get('location')) {
     const loc = r.headers.get('location');
     if (loc && /script\.googleusercontent\.com/i.test(loc)) {
-      r = await fetch(loc, { redirect: 'follow' });
+      r = await fetch(loc, { redirect: 'follow', headers: { 'accept': 'application/json' } });
     }
   }
 
@@ -70,56 +92,54 @@ async function gasAction(action, params = {}) {
   return json;
 }
 
-// ---- REST proxy (for smoke tests)
+// ------------------------------
+// Simple REST surface (smoke)
+// ------------------------------
 app.get('/health', async (_req, res) => {
   try {
     const out = await gasAction('health');
     return res.json({ ok: true, protocol: MCP_PROTOCOL, gas: !!(out && out.ok), ts: out.ts || null });
   } catch (e) {
-    return res.status(424).json({ ok:false, gas:false, error: String(e?.message || e) });
+    return res.status(424).json({ ok: false, gas: false, error: String(e?.message || e) });
   }
 });
 
 app.get('/tools/list', requireToken, async (_req, res) => {
   try {
-    const out = await gas('tools/list');
+    const out = await gasAction('tools/list');
     return res.json({ ok: true, tools: mapToolsReadOnly(out.tools || []) });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e && e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-
 
 app.post('/tools/call', requireToken, async (req, res) => {
   try {
     const { name, arguments: args = {} } = req.body || {};
-    if (!name) return res.status(400).json({ ok:false, error:'name is required' });
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
     const out = await gasAction('tools/call', { name, ...args });
     return res.json(out);
   } catch (e) {
-    return res.status(424).json({ ok:false, error: String(e?.message || e) });
+    return res.status(424).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-if (m.method === 'tools/list') {
-  const out = await gas('tools/list');
-  return send({
-    result: { tools: mapToolsReadOnly(out.tools || []) }
-  });
-}
-
-// ---- Minimal MCP over HTTP (Inspector-friendly)
+// --------------------------------------------------
+// Minimal MCP over HTTP (Streamable HTTP transport)
+// initialize → tools/list → tools/call
+// --------------------------------------------------
 app.post('/mcp', requireToken, async (req, res) => {
-  const { jsonrpc, id, method, params = {} } = req.body || {};
+  const { id, method, params = {} } = req.body || {};
   const rpcError = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
 
   try {
     if (method === 'initialize') {
       return res.json({
-        jsonrpc: '2.0', id,
+        jsonrpc: '2.0',
+        id,
         result: {
           protocolVersion: MCP_PROTOCOL,
-          serverInfo: { name: 'yfl-drive-bridge', version: '3.4.2' },
+          serverInfo: { name: 'yfl-drive-bridge', version: '3.4.3' },
           capabilities: { tools: { listChanged: true } }
         }
       });
@@ -127,19 +147,19 @@ app.post('/mcp', requireToken, async (req, res) => {
 
     if (method === 'tools/list') {
       const out = await gasAction('tools/list');
-      const tools = (out.tools || []).map(t => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.input_schema || t.inputSchema || { type: 'object' }
-      }));
-      return res.json({ jsonrpc: '2.0', id, result: { tools } });
+      return res.json({
+        jsonrpc: '2.0',
+        id,
+        result: { tools: mapToolsReadOnly(out.tools || []) }
+      });
     }
 
     if (method === 'tools/call') {
       const { name, arguments: args = {} } = params;
       if (!name) return rpcError(-32602, 'name is required');
       const out = await gasAction('tools/call', { name, ...args });
-      // Spec-compliant: text content + structuredContent (no {type:"json"})
+
+      // Spec-consistent: textual content plus structured payload
       return res.json({
         jsonrpc: '2.0',
         id,
