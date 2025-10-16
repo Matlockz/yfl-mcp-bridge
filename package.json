@@ -1,13 +1,19 @@
 {
-  "name": "yfl-mcp-bridge",
-  "version": "3.4.10",
+  "name": "yfl-drive-bridge",
+  "version": "3.1.0",
   "type": "module",
-  "private": true,
+  "description": "YFL Drive Bridge — MCP Streamable HTTP server that proxies to a GAS web app",
+  "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "dev": "NODE_ENV=development node server.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0"
   }
