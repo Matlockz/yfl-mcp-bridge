@@ -1,18 +1,20 @@
-// server.js — YFL Drive Bridge (GAS action proxy + MCP over HTTP)
-// CommonJS (node ≥18). No "type":"module" required.
+'use strict';
+
+// YFL Drive Bridge — GAS action proxy + MCP over HTTP (CommonJS)
+// Node 18+ (global fetch available)
 
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
-// ---- App
+// ----- App & middleware
 const app = express();
 app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-// ---- Env
+// ----- Env
 const PORT         = process.env.PORT || 10000;
 const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
 const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, '');
@@ -20,33 +22,28 @@ const GAS_KEY      = process.env.GAS_KEY || '';
 const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 const DEBUG        = String(process.env.DEBUG || '0') === '1';
 
-// ---- Auth helper (header OR query "token")
+// ----- Auth for /tools/* and /mcp (header or query)
 function requireToken(req, res, next) {
   const q  = (req.query.token || '').trim();
   const hd = (req.get('X-Bridge-Token') || '').trim();
   const t  = hd || q;
-  if (!TOKEN || t !== TOKEN) {
-    return res.status(401).json({ ok: false, error: 'bad token' });
-  }
+  if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
   next();
 }
 
-// ---- Tool annotations: tell ChatGPT these are safe, read-only calls
+// ----- Read-only tool annotations (MCP)
 function mapToolsReadOnly(tools = []) {
-  return tools.map(t => ({
+  return tools.map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
-    // non-normative MCP hint recognized by clients incl. ChatGPT
     annotations: { readOnlyHint: true }
   }));
 }
 
-// ---- GAS action helper (follows one redirect to googleusercontent)
+// ----- GAS action helper (manual 302 follow + JSON guard)
 async function gasAction(action, params = {}) {
-  if (!GAS_BASE_URL || !GAS_KEY) {
-    throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
-  }
+  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
 
   const usp = new URLSearchParams({ action, token: GAS_KEY });
   for (const [k, v] of Object.entries(params)) {
@@ -55,45 +52,46 @@ async function gasAction(action, params = {}) {
   }
   const url = `${GAS_BASE_URL}?${usp.toString()}`;
 
-  // first request (manual redirect so we can diagnose)
+  // First request (don’t auto-follow so we can diagnose)
   let r = await fetch(url, { redirect: 'manual' });
 
-  // Apps Script web apps often 302 to script.googleusercontent.com (follow once)
+  // If Apps Script redirects to googleusercontent, follow once
   const loc = r.headers.get('location');
-  if ((r.status === 302 || r.status === 303) && loc) {
+  if ((r.status === 302 || r.status === 303) && loc && /script\.googleusercontent\.com/i.test(loc)) {
     r = await fetch(loc, { redirect: 'follow' });
   }
 
   const ct = (r.headers.get('content-type') || '').toLowerCase();
+  const text = await r.text();
+
   if (!ct.includes('application/json')) {
-    const body = await r.text().catch(() => '');
     throw new Error(
-      `GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${body.slice(0, 200)}`
+      `GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${text.slice(0, 200)}`
     );
   }
 
-  const json = await r.json();
-  if (DEBUG) console.log('GAS', action, '→', JSON.stringify(json).slice(0, 200));
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Invalid JSON from GAS: ${e.message} — first 200 chars: ${text.slice(0, 200)}`);
+  }
+
+  if (DEBUG) console.log('GAS', action, '→', text.slice(0, 200));
   return json;
 }
 
-// ---- Simple home + health
-app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
+// ----- REST (for local smoke tests)
+
 app.get('/health', async (_req, res) => {
   try {
     const out = await gasAction('health');
-    return res.json({
-      ok: true,
-      protocol: MCP_PROTOCOL,
-      gas: !!(out && out.ok),
-      ts: out.ts || null
-    });
+    return res.json({ ok: true, protocol: MCP_PROTOCOL, gas: !!(out && out.ok), ts: out.ts || null });
   } catch (e) {
     return res.status(424).json({ ok: false, gas: false, error: String(e?.message || e) });
   }
 });
 
-// ---- REST proxy (smoke tests)
 app.get('/tools/list', requireToken, async (_req, res) => {
   try {
     const out = await gasAction('tools/list');
@@ -114,18 +112,17 @@ app.post('/tools/call', requireToken, async (req, res) => {
   }
 });
 
-// ---- MCP over HTTP (Inspector & ChatGPT)
-const rpcError = (id, code, message) =>
-  ({ jsonrpc: '2.0', id, error: { code, message } });
+// ----- MCP over HTTP (Inspector / ChatGPT connector)
 
-// Some clients ping GET /mcp before POSTing initialize; return 200 OK.
 app.get('/mcp', requireToken, (_req, res) => {
-  res.json({ ok: true, message: 'MCP endpoint. Use POST /mcp for JSON-RPC.' });
+  // Lightweight GET so clients that probe with GET don’t get 404.
+  return res.json({ ok: true, mcp: true, protocol: MCP_PROTOCOL, server: 'yfl-drive-bridge' });
 });
-app.head('/mcp', requireToken, (_req, res) => res.status(204).end());
 
 app.post('/mcp', requireToken, async (req, res) => {
   const { id, method, params = {} } = req.body || {};
+  const rpcError = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
+
   try {
     if (method === 'initialize') {
       return res.json({
@@ -141,16 +138,13 @@ app.post('/mcp', requireToken, async (req, res) => {
 
     if (method === 'tools/list') {
       const out = await gasAction('tools/list');
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: { tools: mapToolsReadOnly(out.tools || []) }
-      });
+      const tools = mapToolsReadOnly(out.tools || []);
+      return res.json({ jsonrpc: '2.0', id, result: { tools } });
     }
 
     if (method === 'tools/call') {
       const { name, arguments: args = {} } = params;
-      if (!name) return res.json(rpcError(id, -32602, 'name is required'));
+      if (!name) return rpcError(-32602, 'name is required');
       const out = await gasAction('tools/call', { name, ...args });
       return res.json({
         jsonrpc: '2.0',
@@ -163,18 +157,16 @@ app.post('/mcp', requireToken, async (req, res) => {
       });
     }
 
-    return res.json(rpcError(id, -32601, `unknown method: ${method}`));
+    return rpcError(-32601, `unknown method: ${method}`);
   } catch (e) {
     return res.json({
       jsonrpc: '2.0',
       id,
-      result: {
-        content: [{ type: 'text', text: String(e?.message || e) }],
-        isError: true
-      }
+      result: { content: [{ type: 'text', text: String(e?.message || e) }], isError: true }
     });
   }
 });
 
-// ---- Listen
+// ----- Root
+app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
 app.listen(PORT, () => console.log(`YFL MCP Bridge listening on :${PORT}`));
