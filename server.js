@@ -82,17 +82,13 @@ app.get('/health', async (_req, res) => {
 
 app.get('/tools/list', requireToken, async (_req, res) => {
   try {
-    const out = await gasAction('tools/list');
-    const tools = (out.tools || []).map(t => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.input_schema || t.inputSchema || { type: 'object' }
-    }));
-    return res.json({ ok: true, tools });
+    const out = await gas('tools/list');
+    return res.json({ ok: true, tools: mapToolsReadOnly(out.tools || []) });
   } catch (e) {
-    return res.status(424).json({ ok:false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e && e.message || e) });
   }
 });
+
 
 app.post('/tools/call', requireToken, async (req, res) => {
   try {
@@ -104,6 +100,13 @@ app.post('/tools/call', requireToken, async (req, res) => {
     return res.status(424).json({ ok:false, error: String(e?.message || e) });
   }
 });
+
+if (m.method === 'tools/list') {
+  const out = await gas('tools/list');
+  return send({
+    result: { tools: mapToolsReadOnly(out.tools || []) }
+  });
+}
 
 // ---- Minimal MCP over HTTP (Inspector-friendly)
 app.post('/mcp', requireToken, async (req, res) => {
