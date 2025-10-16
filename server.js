@@ -68,7 +68,6 @@ app.get('/health', async (_req, res) => {
 app.get('/tools/list', requireToken, async (_req, res) => {
   try {
     const out = await gasAction('tools/list');
-    // Convert GAS keys to MCP style to keep Inspector happy
     const tools = (out.tools || []).map(t => ({
       name: t.name,
       description: t.description,
@@ -84,7 +83,6 @@ app.post('/tools/call', requireToken, async (req, res) => {
   try {
     const { name, arguments: args = {} } = req.body || {};
     if (!name) return res.status(400).json({ ok:false, error:'name is required' });
-    // Fan out arguments as query params for GAS
     const out = await gasAction('tools/call', { name, ...args });
     return res.json(out);
   } catch (e) {
@@ -126,7 +124,6 @@ app.post('/mcp', requireToken, async (req, res) => {
       const { name, arguments: args = {} } = params;
       if (!name) return rpcError(-32602, 'name is required');
       const out = await gasAction('tools/call', { name, ...args });
-      // Return as a JSON content block per MCP
       return res.json({
         jsonrpc: '2.0',
         id,
