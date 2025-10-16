@@ -97,3 +97,27 @@ Refs: ngrok docs & community.
 **Root cause:** TOKEN mismatch between server and client, or stale GAS token.  
 **Fix:** Keep `.env` / PowerShell exports in a single source of truth; rotate tokens across server + connector + scripts together.  
 **Status:** Procedural—covered in smoke block.
+
+### 2025‑10‑16 — ChatGPT connector “404 Not Found” at /mcp (creation)
+**Symptoms**
+- ChatGPT “New Connector” UI shows `Client error '404 Not Found' for url '.../mcp?token=...'`.
+- Local REST + MCP POST work; Inspector can call tools. Connector creation fails.
+**Root cause**
+- Server only implemented `POST /mcp`. The ChatGPT UI probes the URL with `GET`/`HEAD` during creation; 404 aborts setup.
+**Fix**
+- Add `GET /mcp` and `HEAD /mcp` guarded by the same token. Return `{ok:true}` with 200. Keep `POST /mcp` for RPC.
+**Verification (gates)**
+- `Invoke-RestMethod "$base/mcp?token=..."` → 200 JSON.
+- `(Invoke-WebRequest -Method Head "$base/mcp?token=..." ).StatusCode` → 200.
+- Re-create connector; tools list shows `drive.list`, `drive.search`, `drive.get` with `annotations.readOnlyHint=true`.
+
+### 2025‑10‑16 — Bridge not starting (MODULE_NOT_FOUND server.js)
+**Symptoms**: `node: Error: Cannot find module '...\\server.js'`, ngrok ERR_NGROK_3200 (offline).  
+**Root cause**: `package.json` start script pointed at `server.js` while code was `server.mjs`.  
+**Fix**: Set `"type":"module"` and `"start":"node server.mjs"`.  
+**Gate**: Console shows “YFL MCP Bridge listening on :10000”; `GET /health` returns 200 JSON.
+
+### 2025‑10‑16 — Apps Script 302 / non‑JSON
+**Note**: GAS web apps can 302 to `script.googleusercontent.com` and must emit JSON via `ContentService`.  
+**Fix**: Bridge follows one redirect and rejects non‑JSON. *(Vendor facts: Apps Script web app behavior; DriveApp v2 search syntax.)*
+
