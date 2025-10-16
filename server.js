@@ -28,6 +28,15 @@ function requireToken(req, res, next) {
   return next();
 }
 
+// Add near your other helpers
+const mapToolsReadOnly = (tools = []) =>
+  tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
+    annotations: { readOnlyHint: true }     // <-- key line (MCP spec)
+  }));
+
 // ---- GAS helper (action style) with 302 follow
 async function gasAction(action, params = {}) {
   if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
