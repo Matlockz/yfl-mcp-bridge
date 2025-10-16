@@ -1,74 +1,61 @@
 # YFL Drive Bridge — Known Issues & Fixes (living log)
 
-_Last updated: YYYY‑MM‑DD_
+_Last updated: 2025‑10‑16_
 
 ## 0) Where to start, every time
 1. Open **Runbook** + **Smoke Test Checklist** in `/Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here/`.  
 2. Run bridge health and MCP round‑trip exactly as written there.  
-3. If anything fails, stop here and record the failure below before trying new changes.
+3. If anything fails, stop here and record the failure below before trying new changes. :contentReference[oaicite:17]{index=17}
 
 ---
 
 ## 1) GAS returns HTML or 302 (accounts.google.com) instead of JSON
 **Symptom**: Logs show `GAS returned non‑JSON (302 text/html...)`.  
-**Cause**: Wrong deployment or path. Apps Script web‑apps serve JSON through **ContentService** and redirect via `script.googleusercontent.com`; you *must* hit the published **/exec** URL and pass any routing in the **query string** (e.g., `?action=health`)【:contentReference[oaicite:13]{index=13}】.  
+**Cause**: Wrong deployment or path. Apps Script web‑apps must be called at the **/exec** URL and return JSON via **ContentService** from `doGet(e)`. Parameters arrive via `e.parameter`.  
 **Fix**:
-- Confirm **Active deployment** is Web app, Execute as **Me**, Who has access **Anyone (anonymous)**.  
-- Ensure the bridge points to the **/exec** URL.  
-- If the server calls `/api/health`, use `/?action=health` or support both (fallback pattern is acceptable).
+- Confirm **Web app** deployment with **Execute as “Me”** and **Who has access “Anyone”**.  
+- Call `/exec` with `?action=...&token=...` (no `/api/...` paths).  
+**Refs**: Google Web Apps + ContentService docs. :contentReference[oaicite:18]{index=18}
 
 ---
 
 ## 2) Token mismatch (“bad token” on /tools/* or /mcp)
-**Symptom**: 401 `bad token` in logs; calls omit the header or query token.  
-**Fix**: For bridge REST and MCP: include **`X-Bridge-Token: $TOKEN`** (REST) or append **`?token=$TOKEN`** to the MCP URL (Inspector/clients). Keep `GAS_KEY` (for the Apps Script) and `BRIDGE_TOKEN` (for the bridge) distinct in `.env`, even if currently equal.
+**Symptom**: 401 `bad token`; missing `X‑Bridge‑Token` header or missing `?token=` on `/mcp`.  
+**Fix**: Always pass **`X‑Bridge‑Token: <TOKEN>`** for REST calls and **append `?token=<TOKEN>`** on the MCP URL. Keep GAS’s `token` (for Apps Script) and the bridge’s token distinct, even if set equal.
 
 ---
 
-## 3) MCP Inspector won’t connect / can’t list tools
-**Symptom**: STDIO selected by mistake, config map wrong, or URL missing `/mcp?token=...`.  
-**Fix**:
-- Use **HTTP(S)** and launch via CLI:  
-  `npx @modelcontextprotocol/inspector --connect http://localhost:10000/mcp?token=$env:TOKEN`【 :contentReference[oaicite:16]{index=16}】  
-- If using a config file, the schema is an `mcpServers` map keyed by name, not an array named `clients`【:contentReference[oaicite:17]{index=17}】.  
-- Ensure JSON‑RPC shape on `tools/list` matches the spec (`result.tools` is an array)【:contentReference[oaicite:18]{index=18}】.
+## 3) MCP Inspector won’t connect / tools list empty
+**Symptom**: Connected with **STDIO** by mistake, config schema off, or MCP URL missing `?token=`.  
+**Fix**: Use **Streamable HTTP**; connect the UI to `http://localhost:<port>/mcp?token=<TOKEN>`; expect `tools/list` to return an array.  
+**Refs**: Inspector docs and usage notes. :contentReference[oaicite:19]{index=19}
 
 ---
 
-## 4) Drive search returns nothing or errors
-**Symptom**: Query syntax complaints or empty results.  
-**Fix**: `DriveApp.searchFiles` uses **v2‑style** query fields such as `title`, `trashed`, `modifiedDate`. Example:  
-`title contains 'START_HERE' and trashed = false`【:contentReference[oaicite:19]{index=19}】.
+## 4) Drive search/list quirks
+**Symptom**: Queries with `name` field or v3 terms don’t match; `drive.list` returned empty results when a file id was passed.  
+**Fix**:  
+- Use **v2** query terms for `DriveApp.searchFiles`, e.g., `title contains 'X' and trashed = false`.  
+- For **drive.list**, pass a real **folder id** or use `folderPath`; do not pass a **file** id (ZIP).  
+**Refs**: DriveApp v2 syntax; Advanced Drive v3 for metadata. :contentReference[oaicite:20]{index=20}
 
 ---
 
-## 5) PowerShell “jq not recognized”
-**Symptom**: `jq` missing on Windows.  
-**Fix**: Prefer native PowerShell: `Invoke‑RestMethod ... | ConvertTo‑Json -Depth N` (already used in our smoke tests).
+## 5) ChatGPT Connector creation shows “Unsafe URL”
+**Symptom**: Connector creation fails for `http://localhost...` with **Unsafe URL**.  
+**Cause**: ChatGPT requires a **public HTTPS** MCP endpoint.  
+**Fix**: Tunnel the local server (e.g., **ngrok** / **cloudflared**) and use the HTTPS URL, e.g., `https://abc123.ngrok-free.app/mcp?token=...`.  
+**Ref**: “Connect from ChatGPT” guide (Apps SDK). :contentReference[oaicite:21]{index=21}
 
 ---
 
-## 6) “dotenv” / module not found when starting the bridge
-**Symptom**: `ERR_MODULE_NOT_FOUND` for `dotenv` (or similar).  
-**Fix**: `npm i dotenv node-fetch cors express morgan` (exact deps are listed in `package.json`).
-
----
-
-## Quick sanity commands (no jq)
+## Quick sanity commands (PowerShell, no jq)
 **Health**  
-`Invoke‑RestMethod -Uri "http://localhost:10000/health"`
+`Invoke‑RestMethod -Uri "http://localhost:10000/health" | ConvertTo‑Json -Depth 5`
 
-**Tools list (REST, with header token)**  
-$H = @{ "X-Bridge-Token" = $env:TOKEN }
-Invoke‑RestMethod -Headers $H -Uri "http://localhost:10000/tools/list" | ConvertTo‑Json -Depth 6
+**Tools list (REST)**  
+`$h = @{ 'X‑Bridge‑Token' = '<TOKEN>' }`  
+`Invoke‑RestMethod -Uri "http://localhost:10000/tools/list" -Headers $h | ConvertTo‑Json -Depth 5`
 
-yaml
-Copy code
-
-**Inspector (HTTP/S)**  
-`npx @modelcontextprotocol/inspector --connect "http://localhost:10000/mcp?token=$env:TOKEN"`【 :contentReference[oaicite:20]{index=20}】
-
----
-
-## Changelog
-- 2025‑10‑15: Logged repeated 302 issues from transcripts and added dual‑path `/?action=` fallback reference.
+**Search**  
+`Invoke‑RestMethod -Method Post -Uri "http://localhost:10000/tools/call" -Headers $h -Body (@{name='drive.search'; arguments=@{ query="title contains 'X' and trashed = false"; limit=10 }} | ConvertTo‑Json -Depth 5) -ContentType "application/json"`
