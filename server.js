@@ -1,5 +1,5 @@
 // server.mjs — YFL Drive Bridge (action-style GAS proxy + MCP)
-// Node 18+ (ESM). No dotenv required (export env vars in your shell).
+// Node 18+ (ESM).
 
 import express from 'express';
 import cors from 'cors';
@@ -19,7 +19,7 @@ const GAS_KEY      = process.env.GAS_KEY || '';
 const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
 const DEBUG        = String(process.env.DEBUG || '0') === '1';
 
-// ---- Auth for bridge (header or query)
+// ---- Bridge auth (header or query)
 function requireToken(req, res, next) {
   const q  = (req.query.token || '').trim();
   const hd = (req.get('X-Bridge-Token') || '').trim();
@@ -28,11 +28,9 @@ function requireToken(req, res, next) {
   return next();
 }
 
-// ---- GAS helper (action style)
+// ---- GAS helper (action style: /exec?action=...&token=...)
 async function gasAction(action, params = {}) {
-  if (!GAS_BASE_URL || !GAS_KEY) {
-    throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
-  }
+  if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
   const usp = new URLSearchParams({ action, token: GAS_KEY });
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
@@ -40,8 +38,8 @@ async function gasAction(action, params = {}) {
   }
   const url = `${GAS_BASE_URL}?${usp.toString()}`;
 
-  // Use global fetch (Node 18+); do not follow redirects (detect auth/HTML)
-  const r = await fetch(url, { redirect: 'manual' });
+  // Follow Apps Script's one-time redirect to script.googleusercontent.com.
+  const r = await fetch(url, { redirect: 'follow' });
   const ct = (r.headers.get('content-type') || '').toLowerCase();
 
   if (!ct.includes('application/json')) {
@@ -55,7 +53,7 @@ async function gasAction(action, params = {}) {
   return json;
 }
 
-// ---- REST proxy (for simple smoke tests)
+// ---- REST proxy (for smoke tests)
 app.get('/health', async (_req, res) => {
   try {
     const out = await gasAction('health');
@@ -92,10 +90,8 @@ app.post('/tools/call', requireToken, async (req, res) => {
 
 // ---- Minimal MCP over HTTP (for MCP Inspector)
 app.post('/mcp', requireToken, async (req, res) => {
-  const { jsonrpc, id, method, params = {} } = req.body || {};
-  function rpcError(code, message) {
-    return res.json({ jsonrpc: '2.0', id, error: { code, message } });
-  }
+  const { id, method, params = {} } = req.body || {};
+  function rpcError(code, message) { return res.json({ jsonrpc: '2.0', id, error: { code, message } }); }
 
   try {
     if (method === 'initialize') {
@@ -124,20 +120,12 @@ app.post('/mcp', requireToken, async (req, res) => {
       const { name, arguments: args = {} } = params;
       if (!name) return rpcError(-32602, 'name is required');
       const out = await gasAction('tools/call', { name, ...args });
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: { content: [{ type: 'json', json: out }], isError: false }
-      });
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'json', json: out }], isError: false } });
     }
 
     return rpcError(-32601, `unknown method: ${method}`);
   } catch (e) {
-    return res.json({
-      jsonrpc: '2.0',
-      id,
-      result: { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true }
-    });
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: String(e && e.message || e) }], isError: true } });
   }
 });
 
