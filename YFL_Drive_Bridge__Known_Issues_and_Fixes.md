@@ -44,3 +44,56 @@ _Last updated: 2025‑10‑16_
 ## 2025‑10‑12 — Inspector transport mismatch
 **Symptom**: “Server ‘0’ not found” / no tools.  
 **Fix**: Use **Streamable HTTP**, URL `http://localhost:10000/mcp?token=...`, Connection **Via Proxy**.
+
+# YFL Drive Bridge — Known Issues & Fixes (append-only)
+_Last updated: 2025-10-16_
+
+## 1) Connector creation shows **404 Not Found** for `/mcp?token=...`
+**Symptom:** ChatGPT “New Connector” dialog errors with 404; server logs show no hit or only POSTs later.  
+**Root cause:** Bridge exposed only `POST /mcp`; the connector UI probes with **GET/HEAD** first.  
+**Fix:** Add `GET /mcp` (200 JSON) and `HEAD /mcp` (204), keep `POST /mcp` for JSON‑RPC.  
+**Status:** Fixed in server v3.4.5. (Spec allows GET for streaming transports; returning 2xx is acceptable.)  
+Refs: MCP HTTP transport notes.  
+---
+
+## 2) “User input required” / non‑interactive stalls
+**Symptom:** Chat prompts fail claiming authorization required.  
+**Root cause:** Tools not marked read‑only.  
+**Fix:** In `tools/list`, include `annotations.readOnlyHint: true` per tool.  
+**Status:** Fixed in server v3.4.5.  
+---
+
+## 3) GAS returns HTML (302 / content-type text/html)
+**Symptom:** Bridge error: “GAS returned non‑JSON (302 text/html)”.  
+**Root cause:** Apps Script web app redirects to `script.googleusercontent.com`; naive fetch didn’t follow; or missing `ContentService.MimeType.JSON`.  
+**Fix:** Bridge follows 302/303 → `script.googleusercontent.com` and enforces JSON; Apps Script returns JSON via `ContentService.createTextOutput(...).setMimeType(ContentService.MimeType.JSON)`.  
+**Status:** Fixed in `gasAction` and GAS.  
+Refs: Apps Script Web Apps & ContentService docs.  
+---
+
+## 4) Wrong Drive search query field
+**Symptom:** No results when searching.  
+**Root cause:** Using `name contains` with `DriveApp.searchFiles` (v2-style) which expects **`title contains`** and `trashed = false`.  
+**Fix:** Use `title contains '...' and trashed = false`.  
+**Status:** Documented in runbook and examples.  
+Refs: DriveApp `searchFiles` examples.  
+---
+
+## 5) Port in use (EADDRINUSE)
+**Symptom:** `Error: listen EADDRINUSE :::10000`.  
+**Fix:** Either `Get-Process node | Stop-Process -Force` or reuse the running server (don’t start twice).  
+**Status:** Procedural—listed in smoke checklist.  
+---
+
+## 6) ngrok browser interstitial (ERR_NGROK_6024)
+**Symptom:** Browser/PowerShell calls return the ngrok warning page.  
+**Fix:** For manual testing add header `ngrok-skip-browser-warning: 1`. The ChatGPT connector is not a browser and doesn’t need this.  
+**Status:** Documented.  
+Refs: ngrok docs & community.  
+---
+
+## 7) Token/key drift
+**Symptom:** Health passes but tools 401/403.  
+**Root cause:** TOKEN mismatch between server and client, or stale GAS token.  
+**Fix:** Keep `.env` / PowerShell exports in a single source of truth; rotate tokens across server + connector + scripts together.  
+**Status:** Procedural—covered in smoke block.
