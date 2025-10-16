@@ -1,65 +1,43 @@
 // server.mjs — YFL Drive Bridge (GAS action proxy + MCP over HTTP)
-// Node 18+ (ESM)
+// Node 18+ (ESM). Requires: express, cors, morgan.
 
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 
-// ------------------------------
-// Defaults (overridable via env)
-// ------------------------------
-const DEFAULT_GAS_BASE_URL =
-  'https://script.google.com/macros/s/AKfycbzK3N03phivSJsZasvRmhPwYlaS4gFCnR-pvxUmUWZpihXJOaucg5Lw249lZA9vC5p0ZA/exec';
-const DEFAULT_KEY = 'v3c3NJQ4i94'; // SHARED_KEY and bridge token default
-
-// ------------------------------
-// Env
-// ------------------------------
-const PORT         = process.env.PORT || 10000;
-const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || DEFAULT_KEY;
-const GAS_BASE_URL = (process.env.GAS_BASE_URL || DEFAULT_GAS_BASE_URL).replace(/\/+$/, '');
-const GAS_KEY      = process.env.GAS_KEY || DEFAULT_KEY;
-const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
-const DEBUG        = String(process.env.DEBUG || '0') === '1';
-
-// ------------------------------
-// App wiring
-// ------------------------------
 const app = express();
 app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-// ------------------------------
-// Bridge auth (header or ?token)
-// ------------------------------
+// ---- Env
+const PORT         = process.env.PORT || 10000;
+const TOKEN        = process.env.TOKEN || process.env.BRIDGE_TOKEN || '';
+const GAS_BASE_URL = (process.env.GAS_BASE_URL || '').replace(/\/+$/, '');
+const GAS_KEY      = process.env.GAS_KEY || '';
+const MCP_PROTOCOL = process.env.MCP_PROTOCOL || '2024-11-05';
+const DEBUG        = String(process.env.DEBUG || '0') === '1';
+
+// ---- Bridge auth (header X-Bridge-Token or ?token=)
 function requireToken(req, res, next) {
-  const q  = (req.query.token || '').trim();
-  const hd = (req.get('X-Bridge-Token') || '').trim();
+  const q  = String(req.query.token || '').trim();
+  const hd = String(req.get('X-Bridge-Token') || '').trim();
   const t  = hd || q;
   if (!TOKEN || t !== TOKEN) return res.status(401).json({ ok: false, error: 'bad token' });
   return next();
 }
 
-// -------------------------------------------
-// Helper: mark tools read-only for the client
-// -------------------------------------------
-function mapToolsReadOnly(tools = []) {
-  return tools.map(t => ({
+// ---- Tool annotations → mark as read-only for non-interactive turn
+const mapToolsReadOnly = (tools = []) =>
+  tools.map(t => ({
     name: t.name,
     description: t.description,
     inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
-    // Important: hint to clients that these are non-mutating read-only actions.
-    // MCP tool annotations are an extension point recognized by clients. 
-    // See MCP "tool annotations" docs (readOnlyHint). 
-    annotations: { readOnlyHint: true }
+    annotations: { readOnlyHint: true } // MCP hint for safe, non-interactive usage
   }));
-}
 
-// ------------------------------------------------------
-// GAS call helper (action style) with one 302 follow
-// ------------------------------------------------------
+// ---- Apps Script action helper (follows the 302 to googleusercontent)
 async function gasAction(action, params = {}) {
   if (!GAS_BASE_URL || !GAS_KEY) throw new Error('GAS not configured (GAS_BASE_URL / GAS_KEY)');
 
@@ -70,21 +48,23 @@ async function gasAction(action, params = {}) {
   }
   const url = `${GAS_BASE_URL}?${usp.toString()}`;
 
-  // First request (don’t auto-follow so we can diagnose redirects)
-  let r = await fetch(url, { redirect: 'manual', headers: { 'accept': 'application/json' } });
+  // First fetch without auto-follow so we can observe a 302 from script.google.com
+  let r = await fetch(url, { redirect: 'manual' });
 
-  // Apps Script Web Apps often 302 to script.googleusercontent.com
+  // Follow a single redirect to script.googleusercontent.com (common for ContentService)
   if ((r.status === 302 || r.status === 303) && r.headers.get('location')) {
     const loc = r.headers.get('location');
     if (loc && /script\.googleusercontent\.com/i.test(loc)) {
-      r = await fetch(loc, { redirect: 'follow', headers: { 'accept': 'application/json' } });
+      r = await fetch(loc, { redirect: 'follow' });
     }
   }
 
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (!ct.includes('application/json')) {
     const body = await r.text().catch(() => '');
-    throw new Error(`GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${body.slice(0, 200)}`);
+    throw new Error(
+      `GAS returned non-JSON (${r.status} ${ct || 'no-ct'}) — first 200 chars: ${body.slice(0, 200)}`
+    );
   }
 
   const json = await r.json();
@@ -92,9 +72,8 @@ async function gasAction(action, params = {}) {
   return json;
 }
 
-// ------------------------------
-// Simple REST surface (smoke)
-// ------------------------------
+// ------------------------ REST (for smoke tests) ------------------------
+
 app.get('/health', async (_req, res) => {
   try {
     const out = await gasAction('health');
@@ -124,10 +103,8 @@ app.post('/tools/call', requireToken, async (req, res) => {
   }
 });
 
-// --------------------------------------------------
-// Minimal MCP over HTTP (Streamable HTTP transport)
-// initialize → tools/list → tools/call
-// --------------------------------------------------
+// ------------------------ Minimal MCP over HTTP ------------------------
+// JSON-RPC 2.0: initialize → tools/list → tools/call
 app.post('/mcp', requireToken, async (req, res) => {
   const { id, method, params = {} } = req.body || {};
   const rpcError = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
@@ -155,11 +132,12 @@ app.post('/mcp', requireToken, async (req, res) => {
     }
 
     if (method === 'tools/call') {
-      const { name, arguments: args = {} } = params;
+      const { name, arguments: args = {} } = params || {};
       if (!name) return rpcError(-32602, 'name is required');
+
       const out = await gasAction('tools/call', { name, ...args });
 
-      // Spec-consistent: textual content plus structured payload
+      // Tool result: text content + structured mirror for UIs/clients
       return res.json({
         jsonrpc: '2.0',
         id,
@@ -171,7 +149,7 @@ app.post('/mcp', requireToken, async (req, res) => {
       });
     }
 
-    return rpcError(-32601, `unknown method: ${method}`);
+    return rpcError(-32601, `unknown method: ${String(method)}`);
   } catch (e) {
     return res.json({
       jsonrpc: '2.0',
@@ -180,6 +158,8 @@ app.post('/mcp', requireToken, async (req, res) => {
     });
   }
 });
+
+// -----------------------------------------------------------------------
 
 app.get('/', (_req, res) => res.send('YFL MCP Drive Bridge is running.'));
 app.listen(PORT, () => console.log(`YFL MCP Bridge listening on :${PORT}`));
