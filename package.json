@@ -1,16 +1,17 @@
 {
   "name": "yfl-mcp-bridge",
-  "version": "3.4.5",
+  "version": "3.4.6",
   "private": true,
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": { "node": ">=18" },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
