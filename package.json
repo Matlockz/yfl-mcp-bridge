@@ -1,7 +1,8 @@
 {
   "name": "yfl-mcp-bridge",
-  "version": "3.4.9",
+  "version": "3.4.10",
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node server.mjs"
   },
