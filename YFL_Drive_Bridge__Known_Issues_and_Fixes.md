@@ -1,36 +1,33 @@
-## 2025-10-16 — Dive 5: Connector stabilization & non-interactive fix
+# YFL Drive Bridge — Known Issues & Fixes
+_Last updated: 2025‑10‑16_
 
-**Symptoms**
-- ChatGPT Connector creation fails with: `Client error '404 Not Found' for url '.../mcp?token=...'`.
-- MCP Inspector intermittently shows: `MCP error -32001: Request timed out`.
-- Occasional Apps Script responses were `text/html` (302) instead of JSON.
-- Rare non-interactive/OAuth prompts despite read-only usage.
+## 2025‑10‑16 — ChatGPT Connector creation fails with **404 Not Found**
+**Symptom:** “Error creating connector: Client error '404 Not Found' for url '…/mcp?token=…'.”  
+**Root cause:** Bridge only exposed `POST /mcp`. The ChatGPT UI probes the MCP URL with `GET`/`HEAD` first, which returned 404 (method not matched).  
+**Fix:** Add `GET /mcp` and `HEAD /mcp` that return 200 with a minimal JSON banner.  
+**Bridge version:** v3.4.5 (`server.mjs` in this repo).  
+**References:** Express routing is method‑specific; unmatched methods are 404. :contentReference[oaicite:8]{index=8}
 
-**Root causes**
-- Bridge exposed only `POST /mcp`. ChatGPT connector probes MCP URL with **GET** at creation, producing 404.
-- Long Google responses caused the Inspector proxy to exceed its per-call timeout.
-- Apps Script web app often 302‑redirects to `script.googleusercontent.com`; first hop may not be JSON.
-- Tools lacked explicit `annotations.readOnlyHint`.
+---
 
-**Fixes**
-- Added **GET `/mcp`** health handler (token‑guarded) → Connector UI no longer 404s.
-- Implemented **timeout+retry** in `gasAction` (12s default, one quick retry).
-- On 302/303, follow one redirect to `script.googleusercontent.com` and enforce JSON content-type.
-- `tools/list` (REST & MCP) now returns **`annotations: { readOnlyHint: true }`** for every tool.
-- Documented adding `ngrok-skip-browser-warning: 1` header to bypass ngrok interstitials.
+## 2025‑10‑15 — MCP Inspector occasional “Request timed out”
+**Symptom:** “MCP error -32001: Request timed out” on `tools/call`.  
+**Cause:** Apps Script response occasionally > Inspector timeout.  
+**Mitigation:** Keep `limit` small in `drive.search`, and avoid large folder listings; re‑run immediately usually succeeds.
 
-**Verification (pass gates)**
-- **Transcript Gate:** errors & fixes captured here (see earlier timeline sections).
-- **Design Gate:** all bridge→GAS calls are `.../exec?action=...&token=<GAS_KEY>`, rejects non‑JSON.
-- **Read‑Only Gate:** `annotations.readOnlyHint` present in `tools/list`.
-- **Runbook Gate:** local smoke tests pass (health / list / search / get).
-- **Inspector Gate:** `initialize → tools/list → tools/call` returns `isError:false`.
-- **Connector Gate:** Connector-only chat completes `drive.search` then `drive.get` without OAuth prompts.
+---
 
-**Version bump**
-- Bridge `3.4.4`. Files updated: `server.mjs`, `package.json`.
+## 2025‑10‑15 — Apps Script returns HTML/302 instead of JSON
+**Symptom:** Bridge error: “GAS returned non‑JSON (text/html)…”.  
+**Cause:** First hop is a 302 to `script.googleusercontent.com` or interstitial (ngrok).  
+**Fix:** Bridge follows 302 to googleusercontent; when testing via ngrok in a browser, send header `ngrok-skip-browser-warning: 1`. :contentReference[oaicite:9]{index=9}
 
-**Notes (citations)**
-- Apps Script doGet / JSON: Google docs.  
-- Drive v2-style query & Drive v3 links on `files.get`.  
-- JSON‑RPC 2.0 shape and MCP annotations/readOnlyHint.  
+---
+
+## 2025‑10‑12 — Token drift / bad token
+**Symptom:** 401 “bad token”.  
+**Fix:** Ensure the same token value is set in:
+- `.env` → `TOKEN`
+- `MCP Server URL` query string `?token=…`
+- Smoke‑test headers: `X-Bridge-Token`.
+
