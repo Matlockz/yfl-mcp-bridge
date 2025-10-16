@@ -10,8 +10,7 @@ import morgan from 'morgan';
 // ------------------------------
 const DEFAULT_GAS_BASE_URL =
   'https://script.google.com/macros/s/AKfycbzK3N03phivSJsZasvRmhPwYlaS4gFCnR-pvxUmUWZpihXJOaucg5Lw249lZA9vC5p0ZA/exec';
-const DEFAULT_KEY = 'v3c3NJQ4i94'; // shared GAS key + bridge token default
-const BRIDGE_VERSION = '3.4.7';
+const DEFAULT_KEY = 'v3c3NJQ4i94'; // SHARED_KEY & bridge token default
 
 // ------------------------------
 // Env
@@ -51,7 +50,8 @@ function mapToolsReadOnly(tools = []) {
     name: t.name,
     description: t.description,
     inputSchema: t.input_schema || t.inputSchema || { type: 'object' },
-    // hint to ChatGPT/MCP clients that these are non-mutating read-only actions
+    // Hint to clients that these are non-mutating read-only actions.
+    // MCP tool annotations extension: readOnlyHint.
     annotations: { readOnlyHint: true }
   }));
 }
@@ -69,7 +69,7 @@ async function gasAction(action, params = {}) {
   }
   const url = `${GAS_BASE_URL}?${usp.toString()}`;
 
-  // First request (don’t auto-follow so we can diagnose)
+  // First request (diagnose redirects)
   let r = await fetch(url, { redirect: 'manual', headers: { accept: 'application/json' } });
 
   // Apps Script Web Apps often 302 to script.googleusercontent.com
@@ -97,13 +97,7 @@ async function gasAction(action, params = {}) {
 app.get('/health', async (_req, res) => {
   try {
     const out = await gasAction('health');
-    return res.json({
-      ok: true,
-      version: BRIDGE_VERSION,
-      protocol: MCP_PROTOCOL,
-      gas: !!(out && out.ok),
-      ts: out.ts || null
-    });
+    return res.json({ ok: true, protocol: MCP_PROTOCOL, gas: !!(out && out.ok), ts: out.ts || null });
   } catch (e) {
     return res.status(424).json({ ok: false, gas: false, error: String(e?.message || e) });
   }
@@ -130,12 +124,19 @@ app.post('/tools/call', requireToken, async (req, res) => {
 });
 
 // --------------------------------------------------
-// Minimal MCP over HTTP (Streamable HTTP transport)
-// initialize → tools/list → tools/call
+// MCP over HTTP (Streamable HTTP transport)
+// 1) Lightweight GET banner (for connector probe)
+// 2) Real POST RPC (initialize/tools/*)
 // --------------------------------------------------
 app.get('/mcp', requireToken, (_req, res) => {
-  // Helps connector creation/health probes avoid 404s
-  res.json({ ok: true, transport: 'mcp/streamable-http', version: BRIDGE_VERSION });
+  // This route exists solely so the Connectors UI GET-probe returns 200.
+  res.json({
+    ok: true,
+    transport: 'streamable-http',
+    how: 'POST this same URL with JSON-RPC 2.0 (initialize → tools/list → tools/call)',
+    server: 'yfl-drive-bridge',
+    version: '3.4.8'
+  });
 });
 
 app.post('/mcp', requireToken, async (req, res) => {
@@ -149,7 +150,7 @@ app.post('/mcp', requireToken, async (req, res) => {
         id,
         result: {
           protocolVersion: MCP_PROTOCOL,
-          serverInfo: { name: 'yfl-drive-bridge', version: BRIDGE_VERSION },
+          serverInfo: { name: 'yfl-drive-bridge', version: '3.4.8' },
           capabilities: { tools: { listChanged: true } }
         }
       });
@@ -157,11 +158,7 @@ app.post('/mcp', requireToken, async (req, res) => {
 
     if (method === 'tools/list') {
       const out = await gasAction('tools/list');
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: { tools: mapToolsReadOnly(out.tools || []) }
-      });
+      return res.json({ jsonrpc: '2.0', id, result: { tools: mapToolsReadOnly(out.tools || []) } });
     }
 
     if (method === 'tools/call') {
