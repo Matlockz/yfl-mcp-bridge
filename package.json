@@ -1,9 +1,8 @@
 {
   "name": "yfl-mcp-bridge",
-  "version": "3.4.4",
+  "version": "3.4.5",
+  "private": true,
   "type": "module",
-  "description": "YFL Drive Bridge (Apps Script proxy + MCP over HTTP)",
-  "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs"
   },
@@ -11,5 +10,8 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
