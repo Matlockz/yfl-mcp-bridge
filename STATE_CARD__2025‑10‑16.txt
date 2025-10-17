@@ -1,0 +1,30 @@
+YFL DRIVE BRIDGE — STATE CARD (2025‑10‑16)
+
+TOGGLES
+• Deep Research: ON
+• Web/Browse: ON
+• Connectors: Google Drive (scoped to /Your Friend Logan/ChatGPT_Assets/**)
+• MCP/Bridge: ON (Streamable HTTP via /mcp)
+
+LIVE FACTS (TODAY)
+• Bridge running (Node 22), ngrok forwarding https://triennially-superwise-lilla.ngrok-free.dev → localhost:10000
+• GAS Web App reachable (server-side), token matched
+• Gates passed: Design, GAS, Drive, Connector, Inspector (functional parity)
+
+FILES TO WATCH
+• server.mjs, package.json, .env
+• GAS deployment (who can access / execute as)
+• smoke.ps1
+
+WHAT’S NEXT (TOP 3)
+1) Keep ngrok up during sessions; consider a persistent HTTPS host later.
+2) Add version in /health and pin small Runbook updates.
+3) Roll light “happy-path” tests into a nightly check (optional).
+
+QUICK COMMANDS
+• Start:  npm start
+• Ngrok:  ngrok http --domain=triennially-superwise-lilla.ngrok-free.dev 10000
+• Smoke:  Set-ExecutionPolicy -Scope Process Bypass -Force; .\smoke.ps1
+
+NOTES
+• PowerShell 5.1 lacks &&/||; use newlines or upgrade to PS 7+. (Microsoft announced these operators in PS 7.) 
