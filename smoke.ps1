@@ -1,4 +1,6 @@
-# --- YFL Bridge smoke (PS 5/7) ---
+# --- YFL Bridge smoke (PS 5/7) v1.3 ---
+Param()
+
 $BASE  = "https://triennially-superwise-lilla.ngrok-free.dev"
 $TOKEN = "v3c3NJQ4i94"
 $GAS   = "https://script.google.com/macros/s/AKfycbzK3N03phivSJsZasvRmhPwYlaS4gFCnR-pvxUmUWZpihXJOaucg5Lw249lZA9vC5p0ZA/exec"
@@ -14,7 +16,7 @@ Write-Host "`n— Echo —" -ForegroundColor Cyan
 Write-Host (" GAS  = " + $GAS)
 Write-Host (" MCP  = " + $MCP)
 
-# 1) GAS health (use explicit -Uri build to avoid paste artefacts)
+# 1) GAS health (explicit -Uri to avoid paste artefacts)
 $gasHealthUri = ($GAS + "?action=health&token=" + $TOKEN)
 try {
   Write-Host "`n1) GAS health" -ForegroundColor Cyan
@@ -37,7 +39,8 @@ try {
 # 4) /mcp GET
 Write-Host "`n4) /mcp GET probe" -ForegroundColor Cyan
 try {
-  Invoke-RestMethod -Uri $MCP -Method GET -Headers @{ "ngrok-skip-browser-warning"="1" } | Format-List
+  $getProbe = Invoke-RestMethod -Uri $MCP -Method GET -Headers @{ "ngrok-skip-browser-warning"="1" }
+  [pscustomobject]@{ ok = $true; transport = $getProbe.transport } | Format-List
 } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
 
 # 5) initialize
@@ -54,6 +57,7 @@ if ($tools -and $tools.result -and $tools.result.tools) {
   $names = ($tools.result.tools | ForEach-Object { $_.name }) -join ", "
 }
 [pscustomobject]@{ ok=$ok; tools=$names } | Format-List
+
 # 7) drive.search
 Write-Host "`n7) drive.search (v2 query)" -ForegroundColor Cyan
 $searchBody = '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"drive.search","arguments":{"query":"title contains \"ChatGPT_Transcript_Quill_LoganBot_\" and trashed = false","limit":5}}}'
@@ -67,7 +71,7 @@ if ($search -and $search.result -and $search.result.structuredContent -and $sear
   Write-Host "No results." -ForegroundColor Yellow
 }
 
-# 8) drive.get
+# 8) drive.get + 9) drive.export
 if ($firstId) {
   Write-Host "`n8) drive.get (id=$firstId)" -ForegroundColor Cyan
   $getBody = '{"jsonrpc":"2.0","id":"4","method":"tools/call","params":{"name":"drive.get","arguments":{"id":"' + $firstId + '"}}}'
@@ -75,18 +79,20 @@ if ($firstId) {
   $item = $get.result.structuredContent.item
   $item | Select-Object id,name,mimeType,size,modifiedTime,webViewLink,webContentLink | Format-List
 
-  # 9) drive.export
   Write-Host "`n9) drive.export (Docs→text/plain | Sheets→text/csv)" -ForegroundColor Cyan
   $expBody = '{"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"drive.export","arguments":{"id":"' + $firstId + '"}}}'
   $exp = Invoke-RestMethod -Uri $MCP -Method Post -Headers $H -Body $expBody
   if ($exp -and $exp.result -and $exp.result.structuredContent -and $exp.result.structuredContent.item) {
     $ei = $exp.result.structuredContent.item
+    $textPreview = if ($ei.PSObject.Properties.Name -contains 'text' -and $ei.text) {
+      [string]$ei.text.Substring(0, [Math]::Min(160, $ei.text.Length))
+    } else { "" }
     [pscustomobject]@{
       ok   = $exp.result.structuredContent.ok
       id   = $ei.id
       mime = $ei.mime
       size = $ei.size
-      text = (if ($ei.text) { [string]$ei.text.Substring(0, [Math]::Min(160, $ei.text.Length)) } else { "" })
+      text = $textPreview
     } | Format-List
   } else {
     Write-Host "No export payload returned." -ForegroundColor Yellow
