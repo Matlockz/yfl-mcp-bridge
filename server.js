@@ -1,4 +1,4 @@
-// server.mjs
+// server.mjs — YFL Drive Bridge v3.1.1 (adds drive.export to toolList)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -15,7 +15,7 @@ if (!GAS_BASE_URL || !GAS_KEY || !BRIDGE_TOKEN) {
   process.exit(1);
 }
 
-app.set('trust proxy', 1); // correct https URLs behind ngrok
+app.set('trust proxy', 1);
 app.use(cors({
   origin: true,
   methods: ['GET','POST','HEAD','OPTIONS'],
@@ -28,12 +28,6 @@ app.use(morgan('dev'));
 const j = (res, code, obj) => res.status(code).json(obj);
 const ok = (obj={}) => ({ ok: true, ...obj });
 const err = (msg, data={}) => ({ ok: false, error: msg, ...data });
-
-const absoluteUrl = (req, pathAndQuery) => {
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  return `${proto}://${host}${pathAndQuery}`;
-};
 
 const getTokenFromReq = (req) =>
   (req.query.token) ||
@@ -72,21 +66,6 @@ function normalizeGasPayload(g){
   return g;
 }
 
-function rpcOk(id, payload, isError=false){
-  return {
-    jsonrpc: '2.0',
-    id,
-    result: {
-      content: [{ type: 'text', text: JSON.stringify(payload) }],
-      structuredContent: payload,
-      isError
-    }
-  };
-}
-function rpcErr(id, code, message, data){
-  return { jsonrpc: '2.0', id, error: { code, message, data } };
-}
-
 // ---- Health
 app.get('/health', async (req,res)=>{
   try {
@@ -115,55 +94,38 @@ app.post('/tools/call', requireToken, async (req,res)=>{
 
 // ---- MCP (Streamable HTTP)
 app.head('/mcp', requireToken, (req,res)=>res.status(204).end());
-
-app.get('/mcp', requireToken, (req,res)=>{
-  const wantsSSE = (req.headers.accept || '').includes('text/event-stream');
-  if (wantsSSE){
-    res.writeHead(200, {
-      'Content-Type':'text/event-stream',
-      'Cache-Control':'no-cache',
-      'Connection':'keep-alive',
-    });
-    const url = absoluteUrl(req, `/mcp?token=${BRIDGE_TOKEN}`);
-    res.write(`event: endpoint\n`);
-    res.write(`data: ${JSON.stringify({ url, protocolVersion: '2024-11-05' })}\n\n`);
-    const iv = setInterval(()=>res.write(`: keepalive\n\n`), 20000);
-    req.on('close', ()=>clearInterval(iv));
-    return;
-  }
-  j(res, 200, ok({ transport: 'streamable-http' }));
-});
+app.get('/mcp', requireToken, (req,res)=> j(res, 200, ok({ transport: 'streamable-http' })));
 
 app.post('/mcp', requireToken, async (req,res)=>{
   const { id, method, params } = req.body || {};
+  const rpcErr = (code, message, data)=>({ jsonrpc:'2.0', id, error:{ code, message, data }});
+  const rpcOk  = (payload, isError=false)=>({
+    jsonrpc:'2.0', id,
+    result:{ content:[{type:'text',text:JSON.stringify(payload)}], structuredContent: payload, isError }
+  });
+
   try{
     if (!req.body || req.body.jsonrpc !== '2.0')
-      return res.status(400).json(rpcErr(id ?? null, -32600, 'Invalid Request'));
+      return res.status(400).json(rpcErr(-32600, 'Invalid Request'));
 
     if (method === 'initialize'){
-      const result = {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: 'yfl-drive-bridge', version: '3.1.0' }
-      };
-      return res.json({ jsonrpc:'2.0', id, result });
+      return res.json({ jsonrpc:'2.0', id,
+        result:{ protocolVersion:'2024-11-05', capabilities:{ tools:{ listChanged:true } },
+        serverInfo:{ name:'yfl-drive-bridge', version:'3.1.1' } } });
     }
-
     if (method === 'tools/list'){
       return res.json({ jsonrpc:'2.0', id, result: { tools: toolList() }});
     }
-
     if (method === 'tools/call'){
       const name = params?.name;
       const args = params?.arguments || {};
-      if (!name) return res.json(rpcErr(id, -32602, 'Invalid params: missing name'));
+      if (!name) return res.json(rpcErr(-32602, 'Invalid params: missing name'));
       const gas = await callGAS('tools/call', { name, ...args });
-      return res.json(rpcOk(id, normalizeGasPayload(gas), gas?.ok === false));
+      return res.json(rpcOk(normalizeGasPayload(gas), gas?.ok === false));
     }
-
-    return res.json(rpcErr(id, -32601, 'Method not found'));
+    return res.json(rpcErr(-32601, 'Method not found'));
   } catch(e){
-    return res.json(rpcErr(id, -32603, 'Internal error', { detail: String(e) }));
+    return res.json(rpcErr(-32603, 'Internal error', { detail: String(e) }));
   }
 });
 
@@ -171,52 +133,34 @@ function toolList(){
   return [
     {
       name: 'drive.search',
-      description: 'Search Google Drive using DriveApp v2 query syntax (e.g., title contains "X" and trashed = false).',
-      inputSchema: {
-        type:'object',
-        properties:{
-          query:{ type:'string', description:'DriveApp v2 query, e.g., title contains "Report" and trashed = false' },
-          limit:{ type:'integer', minimum:1, maximum:200, default:50 }
-        },
-        required:['query'],
-        additionalProperties:false
-      },
+      description: 'Search Google Drive using DriveApp v2 query (e.g., title contains "X" and trashed = false).',
+      inputSchema: { type:'object',
+        properties:{ query:{type:'string'}, limit:{type:'integer', minimum:1, maximum:200, default:50 } },
+        required:['query'], additionalProperties:false },
       annotations:{ readOnlyHint:true }
     },
     {
       name: 'drive.list',
       description: 'List files in a folder by ID or path.',
-      inputSchema: {
-        type:'object',
-        properties:{
-          folderId:{ type:'string' },
-          folderPath:{ type:'string' },
-          limit:{ type:'integer', minimum:1, maximum:200, default:50 }
-        },
-        additionalProperties:false
-      },
+      inputSchema: { type:'object',
+        properties:{ folderId:{type:'string'}, folderPath:{type:'string'}, limit:{type:'integer', minimum:1, maximum:200, default:50 } },
+        additionalProperties:false },
       annotations:{ readOnlyHint:true }
     },
     {
       name: 'drive.get',
-      description: 'Get metadata (and small text content, when available) for a file by ID.',
-      inputSchema: {
-        type:'object',
-        properties:{
-          id:{ type:'string' },
-          lines:{ type:'integer', description:'Optional: number of head lines to return for text files' }
-        },
-        required:['id'],
-        additionalProperties:true
-      },
+      description: 'Get file metadata by id (Advanced Drive v3).',
+      inputSchema: { type:'object', properties:{ id:{type:'string'} }, required:['id'] },
+      annotations:{ readOnlyHint:true }
+    },
+    {
+      name: 'drive.export',
+      description: 'Export Docs→text/plain, Sheets→text/csv; non-Google files return text or base64.',
+      inputSchema: { type:'object',
+        properties:{ id:{type:'string'}, mime:{type:'string'} }, required:['id'] },
       annotations:{ readOnlyHint:true }
     }
   ];
 }
 
-app.use((req,res)=>j(res, 404, err('not found',{ path:req.path })));
-
-app.listen(PORT, ()=>{
-  console.log(`[bridge] listening on http://localhost:${PORT}`);
-  console.log(`[bridge] MCP endpoint will be: https://<your-public-host>/mcp?token=${BRIDGE_TOKEN}`);
-});
+app.listen(PORT, ()=> console.log(`[bridge] listening on http://localhost:${PORT}`));
