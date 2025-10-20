@@ -1,225 +1,203 @@
-/*************************************************************
- * YFL — Knowledge Indexer (metadata-only, pump-safe) — v1
+/************************************************************
+ * YFL — Knowledge Indexer (pump-safe) — 2025-10-20
  * - Scans /Your Friend Logan/ChatGPT_Assets/Knowledge
- * - Emits: Knowledge__INDEX__LATEST.csv (+ dated snapshot)
- * - Resumes across runs (pump ~4.5 minutes), no overlaps
- * - Metadata only (no content export); fast & quota-friendly
- *
- * Requirements:
- *  - Advanced Drive service: ON (Drive v2)
- *  - Scopes: Drive, (optional) Docs.readonly if you later add exports
- *************************************************************/
+ * - Builds Knowledge__INDEX__LATEST.csv in /Start_Here
+ * - Pump worker (~4.5 min) with backoff + locking
+ ************************************************************/
 
 var KI = {
+  DO_WRITE: true,                        // set false to dry-run
   PATHS: {
     ROOT:       'Your Friend Logan/ChatGPT_Assets/Knowledge',
-    CANON_DIR:  'Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here'
+    START_HERE: 'Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here'
   },
   CSV_FIELDS: ['id','title','mimeType','modifiedDate','fileSize','alternateLink'],
-  PUMP_MS:   Math.floor(4.5 * 60 * 1000), // ~4.5 min safety budget
-  RESUME_MS: 2000                         // schedule next pump soon
+  PAGE: { FOLDER_BATCH: 1000 },          // per pump cycle
+  PUMP_MS: 4.5 * 60 * 1000               // ~4.5 minutes
 };
 
-/** Entrypoint: seeds state then pumps the worker. */
+/** Entrypoint — queues or runs the worker. */
 function kickoffKnowledgeIndexV1() {
-  var s = _state() || {};
-  s.started = (new Date()).toISOString();
-  s.rows    = s.rows  || [];
-  s.stack   = s.stack || [];
-  s.phase   = s.phase || 'scan';
+  var s = _state('init');               // fresh state
+  s.started = new Date().toISOString();
+  s.rows    = [];
+  s.stack   = [];                       // DFS stack of folder IDs
+  s.phase   = 'scan';
   _save(s);
 
-  if (!s.seeded) {
-    var root = _findFolderByPath_(KI.PATHS.ROOT);
-    if (!root) throw new Error('Knowledge root not found at path: ' + KI.PATHS.ROOT);
-    s.stack  = [ root.getId() ];     // DFS over folder IDs
-    s.seeded = true;
-    _save(s);
-  }
+  // seed the stack
+  var root = _findFolderByPath_(KI.PATHS.ROOT);
+  if (!root) throw new Error("Knowledge root not found at path: " + KI.PATHS.ROOT);
+  s.stack.push(root.getId());
+  _save(s);
+
   knowledgeWorker_();
 }
 
-/** Pump worker — runs for ~PUMP_MS, persists and reschedules if needed. */
+/** Pump worker (~4.5 min), DFS over folders, collects rows. */
 function knowledgeWorker_() {
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) return;    // a run is already in-flight
+  var start = Date.now();
+  var lock  = LockService.getScriptLock();   // prevent overlap
+  if (!lock.tryLock(5000)) { _ensurePump_('knowledgeWorker_'); return; }
 
   try {
-    var started = Date.now();
     var s = _state();
-    if (!s) return;
+    while (Date.now() - start < KI.PUMP_MS) {
+      if (!s.stack || s.stack.length === 0) break;
 
-    while (Date.now() - started < KI.PUMP_MS) {
-      if (s.phase === 'scan') {
-        if (!s.stack || s.stack.length === 0) {
-          s.phase = 'finalize';
-          _save(s);
-          continue;
-        }
+      var folderId = s.stack.pop();
+      var folder   = DriveApp.getFolderById(folderId);
 
-        var folderId = s.stack.pop();
-        var folder   = DriveApp.getFolderById(folderId);
+      // push subfolders
+      var sub = folder.getFolders();
+      while (sub.hasNext()) { s.stack.push(sub.next().getId()); }
+      _save(s);
 
-        // Push subfolders (DFS)
-        var subIt = folder.getFolders();
-        while (subIt.hasNext()) {
-          s.stack.push(subIt.next().getId());
-        }
-
-        // Collect file metadata rows
-        var fileIt = folder.getFiles();
-        while (fileIt.hasNext()) {
-          var f  = fileIt.next();
-          var id = f.getId();
-          var row = {
-            id: id,
-            title: f.getName(),
-            mimeType: f.getMimeType(),
-            modifiedDate: _isoUtc_(f.getLastUpdated()),
-            fileSize: f.getSize() || '',
-            alternateLink: 'https://drive.google.com/file/d/' + id + '/view?usp=drivesdk'
-          };
-          s.rows.push(row);
-          if (Date.now() - started >= KI.PUMP_MS) break; // respect budget
-        }
-
-        _save(s);
-        continue;
+      // collect files
+      var files = folder.getFiles();
+      var processed = 0;
+      while (files.hasNext()) {
+        var f = files.next();
+        s.rows.push(_rowForFile_(f));
+        processed++;
+        if (processed % 100 === 0) _save(s);
+        if (Date.now() - start >= KI.PUMP_MS) break;
       }
+      _save(s);
 
-      if (s.phase === 'finalize') {
-        _finalizeKnowledgeCsv_(s.rows || []);
-        // reset for next time
-        s.finished = (new Date()).toISOString();
-        s.rows  = [];
-        s.stack = [];
-        s.phase = 'done';
-        _save(s);
-        break;
-      }
-
-      break; // 'done'
+      if (Date.now() - start >= KI.PUMP_MS) break;
     }
 
-    // Reschedule if not done
-    s = _state();
-    if (s && s.phase !== 'done') {
-      ScriptApp.newTrigger('knowledgeWorker_')
-        .timeBased()
-        .after(KI.RESUME_MS)
-        .create();
+    // continue or finalize
+    if (s.stack && s.stack.length > 0) {
+      _ensurePump_('knowledgeWorker_');        // continue soon
+    } else {
+      s.phase = 'finalize';
+      _save(s);
+      _finalizeKnowledgeCsv_();
     }
   } finally {
     lock.releaseLock();
   }
 }
 
-/* ---------- CSV finalize (no Drive export of content; metadata only) ---------- */
+/** Build a row for a Drive file, computing size for Google types via export. */
+function _rowForFile_(file) {
+  var id   = file.getId();
+  var name = file.getName();
+  var mime = file.getMimeType();
+  var mod  = file.getLastUpdated().toISOString();
+  var size = 0;
+  var link = 'https://drive.google.com/file/d/' + id + '/view?usp=drivesdk';
 
-function _finalizeKnowledgeCsv_(rows) {
-  // Sort stable by title for consistent diffs
-  rows.sort(function(a,b){ return (a.title||'').localeCompare(b.title||''); });
+  // Google-native files need export to estimate bytes.
+  if (mime.indexOf('application/vnd.google-apps') === 0) {
+    var exportMime = (mime === 'application/vnd.google-apps.spreadsheet') ? 'text/csv' : 'text/plain';
+    size = _withBackoff_(function () {
+      var url = 'https://www.googleapis.com/drive/v3/files/' + id +
+                '/export?mimeType=' + encodeURIComponent(exportMime) + '&alt=media'; // alt=media for media stream
+      var res = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } });
+      return res.getBlob().getBytes().length;
+    });
+  } else {
+    // Non-Google files
+    try {
+      size = file.getSize();
+      if (size == null || size === 0) size = file.getBlob().getBytes().length;
+    } catch (e) {
+      size = 0;
+    }
+  }
 
+  return {
+    id: id,
+    title: name,
+    mimeType: mime,
+    modifiedDate: mod,
+    fileSize: String(size),
+    alternateLink: link
+  };
+}
+
+/** Finalize CSV and write to Start_Here. */
+function _finalizeKnowledgeCsv_() {
+  var s = _state();
   var header = KI.CSV_FIELDS.join(',');
-  var out = [header];
+  var lines  = s.rows.map(function (r) { return KI.CSV_FIELDS.map(function (k) { return _csv(r[k]); }).join(','); });
+  var csv    = [header].concat(lines).join('\n');
 
-  for (var i=0; i<rows.length; i++) {
-    var r = rows[i];
-    var line = [
-      _q(r.id),
-      _q(r.title),
-      _q(r.mimeType),
-      _q(r.modifiedDate),
-      _q(r.fileSize),
-      _q(r.alternateLink)
-    ].join(',');
-    out.push(line);
+  if (!KI.DO_WRITE) return;
+
+  var startHere = _findFolderByPath_(KI.PATHS.START_HERE);
+  if (!startHere) throw new Error("Start_Here path not found: " + KI.PATHS.START_HERE);
+
+  var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss');
+  _upsert_(startHere, 'Knowledge__INDEX__LATEST.csv', csv, MimeType.CSV);
+  startHere.createFile('Knowledge__INDEX__' + ts + '.csv', csv, MimeType.CSV);
+}
+
+/* -------------------------- Helpers -------------------------- */
+
+function _csv(v) {
+  var s = (v == null) ? '' : String(v);
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function _withBackoff_(fn, opt) {
+  opt = opt || {};
+  var max = opt.max || 6, wait = opt.wait || 500;
+  for (var i = 0; i < max; i++) {
+    try { return fn(); } catch (e) {
+      if (i === max - 1) throw e;
+      Utilities.sleep(wait + Math.floor(Math.random() * 250));
+      wait = Math.min(wait * 2, 8000);
+    }
   }
-
-  var csv = out.join('\n');
-  var canon = _findFolderByPath_(KI.PATHS.CANON_DIR);
-  if (!canon) throw new Error('Canonical folder not found: ' + KI.PATHS.CANON_DIR);
-
-  // Replace LATEST
-  _deleteByName_(canon, 'Knowledge__INDEX__LATEST.csv');
-  canon.createFile('Knowledge__INDEX__LATEST.csv', csv, MimeType.CSV);
-
-  // Dated snapshot
-  var d = (new Date()).toISOString().slice(0,10); // YYYY-MM-DD
-  canon.createFile('Knowledge__INDEX__' + d + '.csv', csv, MimeType.CSV);
 }
 
-/* ---------- Small helpers ---------- */
-
-function _isoUtc_(d) {
-  return (d && d.toISOString) ? d.toISOString() : (d || '');
+function _ensurePump_(handlerName) {
+  // remove any existing pump for this handler, then schedule soon
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === handlerName && t.getTriggerSource() === ScriptApp.TriggerSource.CLOCK) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger(handlerName).timeBased().after(10 * 1000).create(); // run again ~10s later
 }
 
-function _q(v) {
-  if (v === null || v === undefined) return '';
-  var s = String(v);
-  // Escape quotes, wrap if commas/quotes/newlines
-  if (/[",\r\n]/.test(s)) {
-    s = '"' + s.replace(/"/g,'""') + '"';
-  }
-  return s;
+function _clearPump_(handlerName) {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === handlerName) ScriptApp.deleteTrigger(t);
+  });
 }
 
-function _deleteByName_(folder, name) {
-  var it = folder.getFilesByName(name);
-  while (it.hasNext()) { it.next().setTrashed(true); }
-}
-
+/** Resolve a folder by a "A/B/C" path (DriveApp root). */
 function _findFolderByPath_(path) {
-  var segs = (path || '').split('/').filter(function(x){ return x; });
+  var segs = (path || '').split('/').filter(String);
   var cursor = DriveApp.getRootFolder();
-  for (var i=0; i<segs.length; i++) {
-    var it = cursor.getFoldersByName(segs[i]);
-    if (!it.hasNext()) return null;
-    cursor = it.next(); // take first match
+  for (var i = 0; i < segs.length; i++) {
+    var iter = cursor.getFoldersByName(segs[i]);
+    if (!iter.hasNext()) return null;
+    cursor = iter.next();
   }
   return cursor;
 }
 
-/* ---------- State helpers (ScriptProperties) ---------- */
-
-function _state() {
-  var raw = PropertiesService.getScriptProperties().getProperty('ki.state');
-  return raw ? JSON.parse(raw) : null;
+/** Replace-or-create a file in a folder. */
+function _upsert_(folder, name, content, mimeType) {
+  var it = folder.getFilesByName(name);
+  while (it.hasNext()) { it.next().setTrashed(true); }
+  folder.createFile(name, content, mimeType || MimeType.CSV);
 }
 
+/** JSON state stored in Script Properties. */
+function _state(init) {
+  var key = 'KI_STATE';
+  var sp  = PropertiesService.getScriptProperties();
+  if (init === 'init') { sp.deleteProperty(key); return {}; }
+  var raw = sp.getProperty(key);
+  return raw ? JSON.parse(raw) : {};
+}
 function _save(obj) {
-  PropertiesService.getScriptProperties().setProperty('ki.state', JSON.stringify(obj));
-}
-
-/* ---------- Status ---------- */
-
-function showKnowledgeStatusNow() {
-  var canon = _findFolderByPath_(KI.PATHS.CANON_DIR);
-  var info = {};
-  if (canon) {
-    var latest = canon.getFilesByName('Knowledge__INDEX__LATEST.csv');
-    if (latest.hasNext()) {
-      var f = latest.next();
-      info.knowledgeLatest = {
-        name: f.getName(),
-        bytes: f.getSize(),
-        updated: _isoUtc_(f.getLastUpdated()),
-        url: 'https://drive.google.com/file/d/' + f.getId() + '/view?usp=drivesdk'
-      };
-    }
-  }
-  Logger.log(JSON.stringify(info, null, 2));
-  return info;
-}
-
-/* ---------- Optional: clear any pending pumps for this worker ---------- */
-function _clearPump_(handlerName) {
-  var trigs = ScriptApp.getProjectTriggers();
-  for (var i=0; i<trigs.length; i++) {
-    var t = trigs[i];
-    if (t.getHandlerFunction() === handlerName) {
-      ScriptApp.deleteTrigger(t);
-    }
-  }
+  PropertiesService.getScriptProperties().setProperty('KI_STATE', JSON.stringify(obj || {}));
 }
