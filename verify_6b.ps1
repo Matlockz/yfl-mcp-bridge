@@ -40,13 +40,18 @@ function ItemOf($r) {
 
 # Get the text payload for drive.export results, handling 'text' or 'text/plain'
 function ExportText([string]$id) {
-  $r = Rpc 'tools/call' @{ name = 'drive.export'; arguments = @{ id = $id } }
-  $it = ItemOf $r
+  $res = Rpc 'tools/call' @{ name='drive.export'; arguments=@{ id = $id } }
+  $it  = ItemOf $res
   if ($null -eq $it) { return $null }
-  if ($it.text) { return [string]$it.text }
-  if ($it.'text/plain') { return [string]$it.'text/plain' }
-  # Some bridges may return a single-key item with unknown key; fall back to that value
-  if ($it.Keys -and $it.Keys.Count -eq 1) { return [string]$it[$it.Keys | Select-Object -First 1] }
+
+  if ($it.text) { return [string]$it.text }                # common shape
+  if ($it.'text/plain') { return [string]$it.'text/plain' }# content-type key
+
+  # If the MCP item object has exactly one key, return that value
+  if ($it.Keys -and $it.Keys.Count -eq 1) {
+    $k = ($it.Keys | Select-Object -First 1)               # <-- parentheses
+    return [string]$it[$k]                                  # <-- and here
+  }
   return $null
 }
 
