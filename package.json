@@ -1,6 +1,6 @@
 {
   "name": "yfl-drive-bridge",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "type": "module",
   "description": "YFL Drive Bridge — MCP Streamable HTTP server that proxies to a GAS web app",
   "main": "server.mjs",
@@ -13,6 +13,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "@modelcontextprotocol/sdk": "^0.6.0"
   }
 }
