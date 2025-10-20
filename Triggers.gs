@@ -1,56 +1,87 @@
-/** *****************************************************************
- * Ops Toolkit — Triggers + Admin glue            (2025‑10‑20)
- * Purpose:
- *  - Nightly build of INDEX + CHUNKS (time‑driven trigger)
- *  - One‑shot helpers you can run from the IDE Run menu
+/**
+ * Triggers (idempotent) — 2025‑10‑20
+ * Sets time‑based triggers for:
+ *  - kickoffTranscriptsIndexV2 (daily)
+ *  - inventoryWorker_          (daily, off-hours)
  *
- * Requires:
- *  - ScriptApp (built‑in)
- *  - Your existing kickoffTranscriptsIndexV2() in Transcripts_Indexer.gs
- *******************************************************************/
+ * Also includes: listTriggers(), clearTriggers(), showStatusNow()
+ *
+ * Notes:
+ *  - Uses ScriptApp time-based triggers (ClockTriggerBuilder).
+ *  - Safe to re-run; avoids duplicates by handler name.
+ */
 
-/** Run once to (re)create the time‑driven trigger. */
-function setupTriggers() {
-  const FN = 'kickoffTranscriptsIndexV2';
-  const TZ = Session.getScriptTimeZone() || 'America/Los_Angeles';
+// ---------- Utilities ----------
 
-  // Remove any old time‑driven triggers for this handler to avoid duplicates
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getEventType() === ScriptApp.EventType.CLOCK && t.getHandlerFunction() === FN)
-    .forEach(t => ScriptApp.deleteTrigger(t));
+/** Return an array of current triggers keyed by handler. */
+function _getTriggersByHandler_() {
+  const out = {};
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const h = t.getHandlerFunction();
+    (out[h] ||= []).push(t);
+  });
+  return out;
+}
 
-  // Create a daily trigger ~at the chosen hour in your script time zone.
-  // Note: Apps Script schedules inside the hour; minute is approximate by design.
-  ScriptApp.newTrigger(FN)
+/** Create or replace a single time-based trigger for a handler. */
+function _ensureDailyTrigger_(handler, hourUtc) {
+  // Remove existing triggers for this handler
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  // Create the new daily trigger at specified UTC hour
+  ScriptApp.newTrigger(handler)
     .timeBased()
+    .atHour(hourUtc)              // UTC hour; script time zone applies internally
     .everyDays(1)
-    .atHour(3)            // <-- change this hour if you prefer
-    .inTimezone(TZ)
     .create();
 }
 
-/** See what triggers exist (handy for quick checks). */
+/** Pretty JSON log helper. */
+function _log_(obj) {
+  Logger.log(JSON.stringify(obj, null, 2));
+  return obj;
+}
+
+// ---------- Public: setup / list / clear ----------
+
+/** Idempotent setup — run this once or anytime. */
+function setupTriggers() {
+  // Choose hours that avoid your peak usage; change if you prefer.
+  // These are *approximate*; Apps Script may shift by a few minutes.
+  _ensureDailyTrigger_('kickoffTranscriptsIndexV2', 6); // 06:00 UTC daily
+  _ensureDailyTrigger_('inventoryWorker_',          7); // 07:00 UTC daily
+
+  return listTriggers();
+}
+
+/** Inspect triggers. */
 function listTriggers() {
   const rows = ScriptApp.getProjectTriggers().map(t => ({
     handler: t.getHandlerFunction(),
-    type: String(t.getEventType && t.getEventType()),
-    desc: t.getTriggerSourceId ? String(t.getTriggerSourceId()) : ''
+    type: t.getTriggerSource(),   // CLOCK
+    desc: t.getEventType() || null
   }));
-  Logger.log(JSON.stringify(rows, null, 2));
-  return rows;
+  return _log_(rows);
 }
 
-/** Remove ALL time‑driven triggers created in this project (surgical reset). */
-function nukeTriggers() {
+/** Remove all project triggers (safety valve). */
+function clearTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  return listTriggers();
 }
 
-/** Manual one‑shot: build INDEX + CHUNKS now (same as what the trigger runs). */
-function runNow() {
-  return kickoffTranscriptsIndexV2();
-}
+// ---------- Convenience: status passthrough ----------
 
-/** Optional: quick beacon — surfaces LATEST sizes & links in the log. */
+/**
+ * showStatusNow — quick passthrough to your indexer’s showStatus(),
+ * so you can bind this to a Run menu item for a one-click beacon check.
+ */
 function showStatusNow() {
-  return showStatus(); // re‑use your existing helper in Transcripts_Indexer.gs
+  if (typeof showStatus === 'function') {
+    return _log_(showStatus());
+  }
+  return _log_({ error: 'showStatus() not found. Ensure Transcripts_Indexer.gs is included.' });
 }
