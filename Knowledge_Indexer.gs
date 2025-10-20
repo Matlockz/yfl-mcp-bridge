@@ -1,199 +1,215 @@
-/** ********************************************************************
- * Knowledge Indexer v1 (pump-safe, resumable)
- * - Crawls:  /Your Friend Logan/ChatGPT_Assets/Knowledge
- * - Writes:  WORK CSV in /Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here
- * - Final:   Knowledge__INDEX__YYYY-MM-DD.csv + Knowledge__INDEX__LATEST.csv
- * - Runtime: pumps for ~4.5 minutes, then self-schedules next burst
- * ********************************************************************/
+/** **********************************************************************
+ * YFL — Knowledge Indexer (pump‑safe, resumable) — 2025‑10‑20
+ * - Scans a target Knowledge folder, captures lightweight metadata,
+ * - Appends rows into a temporary Google Sheet during the pump,
+ * - On completion, exports the sheet => Knowledge__INDEX__LATEST.csv.
+ *
+ * Requirements:
+ *  - Advanced Drive API v2 enabled (Resources → Advanced Google services).
+ *  - Scopes: Drive, Docs read-only, *Spreadsheets* (to create/append), ScriptApp.
+ *  - This file is self‑contained: includes backoff, locks, path resolution.
+ *
+ * Notes:
+ *  - Apps Script executions are ~6 minutes max per run. We pump in slices
+ *    and re-schedule until done, using time-based triggers. See quotas. 
+ *  - We avoid Drive “append” by buffering rows to a Sheet, then export. 
+ * **********************************************************************/
 
 var KI = {
-  DO_WRITE: true, // flip to false for dry run
-  ROOT_PATH: 'Your Friend Logan/ChatGPT_Assets/Knowledge',
-  START_HERE_PATH: 'Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here',
-  STOP_EARLY_MS: (4 * 60 * 1000) + 30 * 1000, // stop ~4.5 min to avoid 6-min hard cap
-  CSV_HEADER: 'id,title,mimeType,modifiedTime,size,link\n'
+  DO_WRITE: true, // false = dry run (logs only)
+  PATHS: {
+    // Where to write the LATEST CSV + staging sheet
+    START_HERE: 'Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here',
+    // Which folder tree to scan for "Knowledge" (narrow this to keep runs small)
+    ROOT:       'Your Friend Logan/ChatGPT_Assets/Knowledge'
+  },
+  PAGE_SIZE: 200,                          // Drive.Files.list page size
+  FIELDS: 'items(id,title,mimeType,modifiedDate,fileSize,alternateLink,webViewLink),nextPageToken',
+  CSV_NAME: 'Knowledge__INDEX__LATEST.csv',
+  STAGING_PREFIX: 'Knowledge__INDEX__WORKING__'
 };
 
-/** Entry — seed state and enqueue first pump. */
+// ---- Entry points ------------------------------------------------------
+
 function kickoffKnowledgeIndexV1() {
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.tryLock(10 * 1000)) return;   // another run is active; bail
+
   try {
-    var state = _loadState_();
-    if (state && state.running) {
-      Logger.log('Knowledge index already running; skipping kickoff.');
+    _clearPump_('knowledgeWorker_');      // remove stale pump triggers
+
+    // Resolve target folders
+    var startHere = _findFolderByPath_(KI.PATHS.START_HERE);
+    var root      = _findFolderByPath_(KI.PATHS.ROOT);
+    if (!startHere) throw new Error('START_HERE not found: ' + KI.PATHS.START_HERE);
+    if (!root)      throw new Error('ROOT not found: ' + KI.PATHS.ROOT);
+
+    // Create fresh staging Sheet
+    var stagingName = KI.STAGING_PREFIX + new Date().toISOString().replace(/[:.]/g,'-');
+    var ss = SpreadsheetApp.create(stagingName);
+    var sheet = ss.getActiveSheet();
+    sheet.clear();
+    sheet.appendRow(['id','title','mimeType','modifiedDate','fileSize','alternateLink']);
+
+    // Move staging Sheet into START_HERE
+    DriveApp.getFileById(ss.getId()).moveTo(startHere);
+
+    // Seed state
+    var state = {
+      pageToken: null,
+      written:   0,
+      rootId:    root.getId(),
+      stagingId: ss.getId(),
+      startIso:  new Date().toISOString()
+    };
+    PropertiesService.getScriptProperties().setProperty('KI_STATE', JSON.stringify(state));
+
+    // Kick the first worker slice now
+    return knowledgeWorker_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function knowledgeWorker_() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) return;
+
+  try {
+    var prop = PropertiesService.getScriptProperties();
+    var state = JSON.parse(prop.getProperty('KI_STATE') || '{}');
+    if (!state.stagingId || !state.rootId) {
+      Logger.log('No state; call kickoffKnowledgeIndexV1 first.');
       return;
     }
 
-    var root = _findFolderByPath_(KI.ROOT_PATH);
-    if (!root) throw new Error('Root path not found: ' + KI.ROOT_PATH);
+    var deadlineMs = Date.now() + (5 * 60 * 1000) - 30000; // ~5m minus 30s guard
+    var ss = SpreadsheetApp.openById(state.stagingId);
+    var sheet = ss.getActiveSheet();
 
-    var startHere = _findFolderByPath_(KI.START_HERE_PATH);
-    if (!startHere) throw new Error('Start_Here path not found: ' + KI.START_HERE_PATH);
+    while (Date.now() < deadlineMs) {
+      var resp = Drive.Files.list({
+        q: "'" + state.rootId + "' in parents and trashed = false",
+        maxResults: KI.PAGE_SIZE,
+        pageToken: state.pageToken || null,
+        fields: KI.FIELDS,
+        orderBy: 'modifiedDate desc'
+      });
 
-    // Create WORK CSV in Start_Here
-    var workFile = startHere.createFile('Knowledge__INDEX__WORK.csv', KI.CSV_HEADER, 'text/csv');
-
-    var s = {
-      running: true,
-      started: new Date().toISOString(),
-      rootId: root.getId(),
-      queue: [root.getId()],      // folders to crawl
-      workFileId: workFile.getId(),
-      processed: 0
-    };
-    _saveState_(s);
-  } finally {
-    lock.releaseLock();
-  }
-  _enqueuePump_(10000); // start in ~10s
-}
-
-/** Pump — process until near the time limit, then reschedule. */
-function pumpKnowledgeIndexV1_() {
-  var stopBy = Date.now() + KI.STOP_EARLY_MS;
-
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) { _enqueuePump_(30000); return; } // try again in 30s
-
-  try {
-    var s = _loadState_();
-    if (!s || !s.running) { Logger.log('No knowledge indexing job in progress.'); return; }
-
-    var appended = [];
-
-    while (Date.now() < stopBy && s.queue.length > 0) {
-      var folderId = s.queue.shift();
-      var fold = DriveApp.getFolderById(folderId);
-
-      // Files in this folder
-      var files = fold.getFiles();
-      while (Date.now() < stopBy && files.hasNext()) {
-        var f = files.next();
-        if (f.isTrashed()) continue;
-        if (f.getMimeType() === MimeType.FOLDER) continue; // guard
-
-        appended.push(_csvRow_(f));
-        s.processed++;
-
-        // Periodically flush to the file so we don't build a huge string in memory
-        if (appended.length >= 200) {
-          _appendToFile_(s.workFileId, appended.join(''));
-          appended = [];
-        }
+      var items = (resp && resp.items) ? resp.items : [];
+      if (items.length === 0) {
+        // No more pages -> finalize
+        _finalizeKnowledgeCsv_(state);
+        return;
       }
 
-      // Sub-folders -> push into queue (BFS)
-      var subs = fold.getFolders();
-      while (Date.now() < stopBy && subs.hasNext()) {
-        var sf = subs.next();
-        if (!sf.isTrashed()) s.queue.push(sf.getId());
+      // Build rows and append to sheet in a single batch
+      var rows = items.map(function(it) {
+        return [
+          it.id || '',
+          it.title || '',
+          it.mimeType || '',
+          it.modifiedDate || '',
+          it.fileSize || '',
+          (it.alternateLink || it.webViewLink || '')
+        ];
+      });
+
+      // Append in chunks to avoid 50k cell limits per call
+      _appendRows_(sheet, rows);
+      state.written += rows.length;
+
+      // Next page?
+      state.pageToken = resp.nextPageToken || null;
+      prop.setProperty('KI_STATE', JSON.stringify(state));
+
+      if (!state.pageToken) {
+        _finalizeKnowledgeCsv_(state);
+        return;
       }
-
-      if (Date.now() >= stopBy) break; // hit our time budget
     }
 
-    if (appended.length) _appendToFile_(s.workFileId, appended.join(''));
-
-    if (s.queue.length > 0) {
-      _saveState_(s);
-      _enqueuePump_(10000); // continue in ~10s
-    } else {
-      // Finalize
-      _finalize_(s.workFileId);
-      _clearState_();
-      Logger.log('Knowledge index complete. Files: ' + s.processed);
-    }
+    // Out of time → schedule the next pump in ~1 minute
+    ScriptApp.newTrigger('knowledgeWorker_').timeBased().after(60 * 1000).create();
   } finally {
     lock.releaseLock();
   }
 }
 
-/** -------- Helpers -------------------------------------------------- */
+// ---- Helpers -----------------------------------------------------------
 
-function _appendToFile_(fileId, text) {
-  if (!KI.DO_WRITE) return;
-  var file = DriveApp.getFileById(fileId);
-  var prev = file.getBlob().getDataAsString('UTF-8');
-  file.setContent(prev + text);
+function _appendRows_(sheet, rows) {
+  var i = 0;
+  var BATCH = 2000; // rows per setValues batch (tune if needed)
+  while (i < rows.length) {
+    var chunk = rows.slice(i, i + BATCH);
+    var start = sheet.getLastRow() + 1;
+    var rng = sheet.getRange(start, 1, chunk.length, 6);
+    rng.setValues(chunk);
+    i += BATCH;
+  }
 }
 
-function _csvRow_(f) {
-  var id = f.getId();
-  var title = _csvEscape_(f.getName());
-  var mt = f.getMimeType();
-  var when = Utilities.formatDate(f.getLastUpdated(), 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'");
-  var size = f.getSize() || '';
-  var link = _csvEscape_(f.getUrl());
-  return id + ',' + title + ',' + mt + ',' + when + ',' + size + ',' + link + '\n';
+function _finalizeKnowledgeCsv_(state) {
+  var startHere = _findFolderByPath_(KI.PATHS.START_HERE);
+  var ssId = state.stagingId;
+
+  // Export first sheet as CSV (Drive.Files.export produces text/csv for Sheets)
+  var csvBlob = _withBackoff_(function() {
+    return Drive.Files.export(ssId, 'text/csv').getBlob();
+  });
+
+  if (KI.DO_WRITE) {
+    // Remove any older LATEST file(s)
+    var existing = startHere.getFilesByName(KI.CSV_NAME);
+    while (existing.hasNext()) existing.next().setTrashed(true);
+
+    // Create fresh LATEST
+    startHere.createFile(csvBlob.setName(KI.CSV_NAME));
+  }
+
+  // Clean up staging
+  try { DriveApp.getFileById(ssId).setTrashed(true); } catch (e) {}
+
+  // Clear state
+  PropertiesService.getScriptProperties().deleteProperty('KI_STATE');
+  Logger.log(JSON.stringify({ ok:true, written: state.written, out: KI.CSV_NAME }));
 }
 
-function _csvEscape_(s) {
-  if (s === null || s === undefined) return '""';
-  var t = String(s).replace(/"/g, '""').replace(/\r?\n/g, ' ');
-  return '"' + t + '"';
-}
-
-function _finalize_(workFileId) {
-  if (!KI.DO_WRITE) return;
-  var work = DriveApp.getFileById(workFileId);
-
-  var startHere = _findFolderByPath_(KI.START_HERE_PATH) || DriveApp.getRootFolder();
-  var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-
-  // Dated copy
-  var dated = work.makeCopy('Knowledge__INDEX__' + stamp + '.csv', startHere);
-
-  // Refresh LATEST: trash any existing, then copy as LATEST
-  var it = DriveApp.searchFiles('title = "Knowledge__INDEX__LATEST.csv" and trashed = false');
-  while (it.hasNext()) { it.next().setTrashed(true); }
-  work.makeCopy('Knowledge__INDEX__LATEST.csv', startHere);
-
-  // Optionally trash the work file
-  work.setTrashed(true);
-
-  Logger.log('Finalized: ' + dated.getName());
-}
-
-function _enqueuePump_(ms) {
-  // Clean up older pump triggers for this handler
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction && triggers[i].getHandlerFunction() === 'pumpKnowledgeIndexV1_') {
-      ScriptApp.deleteTrigger(triggers[i]);
+/** Primitive exponential backoff (0.5s → 8s) with jitter. */
+function _withBackoff_(fn) {
+  var delay = 500;
+  for (var i = 0; i < 6; i++) {
+    try { return fn(); }
+    catch (e) {
+      Utilities.sleep(delay + Math.floor(Math.random() * 200));
+      delay = Math.min(delay * 2, 8000);
+      if (i === 5) throw e;
     }
   }
-  ScriptApp.newTrigger('pumpKnowledgeIndexV1_').timeBased().after(ms).create(); // one-shot
+}
+
+function _clearPump_(handlerName) {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === handlerName) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
 }
 
 function _findFolderByPath_(path) {
-  // Split by '/', walk from My Drive root
-  var parts = path.split('/');
-  var cur = DriveApp.getRootFolder();
-  for (var i = 0; i < parts.length; i++) {
-    var name = parts[i].trim();
-    if (!name) continue;
-    var it = cur.getFoldersByName(name);
-    if (!it.hasNext()) return null;
-    cur = it.next();
+  // Very simple path resolver by name (My Drive only).
+  var segs = (path || '').split('/').filter(String);
+  var cursor = DriveApp.getRootFolder();
+  for (var i = 0; i < segs.length; i++) {
+    var found = null;
+    var iter = cursor.getFoldersByName(segs[i]);
+    while (iter.hasNext()) {
+      var f = iter.next();
+      found = f; break; // take the first match
+    }
+    if (!found) return null;
+    cursor = found;
   }
-  return cur;
-}
-
-/** State persisted in ScriptProperties */
-function _loadState_() {
-  var raw = PropertiesService.getScriptProperties().getProperty('KI_V1_STATE');
-  return raw ? JSON.parse(raw) : null;
-}
-function _saveState_(obj) {
-  PropertiesService.getScriptProperties().setProperty('KI_V1_STATE', JSON.stringify(obj));
-}
-function _clearState_() {
-  PropertiesService.getScriptProperties().deleteProperty('KI_V1_STATE');
-}
-
-/** Debug/status helper (optional quick peek in logs) */
-function showKnowledgeStatus() {
-  var s = _loadState_();
-  Logger.log(s ? JSON.stringify(s, null, 2) : 'No job state.');
+  return cursor;
 }
