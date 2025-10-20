@@ -1,35 +1,45 @@
-/** Utilities */
-function _log(obj){ Logger.log(JSON.stringify(obj,null,2)); }
+/*************************************************************
+ * Trigger helpers (idempotent)
+ * - Sets up daily triggers at local hours (script timezone)
+ * - Provides listTriggers() for sanity
+ *************************************************************/
 
-/** Create or replace a single daily trigger (local hour). */
-function _ensureDailyTriggerLocal_(handler, hourLocal){
-  // Remove any prior triggers for this handler
-  ScriptApp.getProjectTriggers().forEach(function(t){
-    if (t.getHandlerFunction() === handler){ ScriptApp.deleteTrigger(t); }
-  });
-  // Create the new daily trigger at the local hour
+function _ensureDailyTriggerLocal_(handler, hourLocal) {
+  // Remove existing triggers for this handler
+  var trigs = ScriptApp.getProjectTriggers();
+  for (var i=0; i<trigs.length; i++) {
+    if (trigs[i].getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(trigs[i]);
+    }
+  }
+  // Create at the specified local hour
   ScriptApp.newTrigger(handler)
     .timeBased()
-    .atHour(hourLocal)    // uses the script's timezone
+    .atHour(hourLocal)     // script timezone (File → Project settings)
     .everyDays(1)
     .create();
 }
 
-/** Idempotent setup — safe anytime. */
-function setupTriggers(){
-  // You said you’re mostly done 5–10am; let’s run at 07:00/08:00/09:00 local.
-  _ensureDailyTriggerLocal_('kickoffTranscriptsIndexV2', 7);
-  _ensureDailyTriggerLocal_('inventoryWorker_',          8);
-  _ensureDailyTriggerLocal_('kickoffKnowledgeIndexV1',   9);
-  return listTriggers();
+/** List all current triggers (for sanity). */
+function listTriggers() {
+  var out = [];
+  var trigs = ScriptApp.getProjectTriggers();
+  for (var i=0; i<trigs.length; i++) {
+    var t = trigs[i];
+    out.push({
+      handler: t.getHandlerFunction(),
+      type: t.getTriggerSource() // 'CLOCK' for time-based
+    });
+  }
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
 }
 
-/** Show current triggers (sanity). */
-function listTriggers(){
-  var out = [];
-  ScriptApp.getProjectTriggers().forEach(function(t){
-    out.push({ handler: t.getHandlerFunction(), type: t.getTriggerSource() });
-  });
-  _log(out);
-  return out;
+/** Idempotent setup — safe to re-run anytime. */
+function setupTriggers() {
+  // You said you’re mostly done 5–10am; run early morning
+  _ensureDailyTriggerLocal_('kickoffTranscriptsIndexV2', 7);  // ~07:00 local
+  _ensureDailyTriggerLocal_('inventoryWorker_',            8);  // ~08:00 local
+  _ensureDailyTriggerLocal_('kickoffKnowledgeIndexV1',     9);  // ~09:00 local
+  return listTriggers();
 }
