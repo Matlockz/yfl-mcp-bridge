@@ -1,31 +1,89 @@
 param(
-  [Parameter(Mandatory=$true)][string]$Base,
-  [Parameter(Mandatory=$true)][string]$Token
+  [string]$Base = "http://localhost:5050",
+  [string]$Token = ""
 )
 
-$ErrorActionPreference = 'Stop'
-Write-Host "» Smoke: $Base" -ForegroundColor Cyan
+$Depth = 12
 
-# Health (local + tunnel)
-try { $local  = Invoke-RestMethod -Uri "http://127.0.0.1:10000/health" -TimeoutSec 5 } catch { $local = @{ ok=$false; err=$_|Out-String } }
-try { $tunnel = Invoke-RestMethod -Uri "$Base/health"             -TimeoutSec 5 } catch { $tunnel = @{ ok=$false; err=$_|Out-String } }
-"Local  /health : $($local  | ConvertTo-Json -Compress)"
-"Tunnel /health : $($tunnel | ConvertTo-Json -Compress)"
-
-# MCP handshake + tools/list + one search
-$H = @{ 'Content-Type'='application/json'; 'MCP-Protocol-Version'='2024-11-05' }
-$MCP = "$Base/mcp?token=$Token"
-
-function Rpc($method, $params) {
-  $body = @{ jsonrpc='2.0'; id=[Guid]::NewGuid().ToString('N'); method=$method; params=$params } | ConvertTo-Json -Depth 10
-  return (Invoke-RestMethod -Uri $MCP -Method Post -Headers $H -Body $body)
+function Write-Json {
+  param([string]$Label, $Obj)
+  if ($null -eq $Obj) { Write-Host "$Label : <null>"; return }
+  try {
+    Write-Host "$Label : " + ($Obj | ConvertTo-Json -Depth $Depth)
+  } catch {
+    Write-Host "$Label : [unserializable] $_"
+  }
 }
 
-$init  = Rpc 'initialize' @{ protocolVersion='2024-11-05' }
-"initialize : $($init  | ConvertTo-Json -Compress)"
+function Invoke-JsonGet {
+  param([string]$Url, [string]$Token)
+  $Headers = @{}
+  if ($Token) { $Headers['x-bridge-token'] = $Token }
+  Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop
+}
 
-$list  = Rpc 'tools/list' @{}
-"tools/list : $($list  | ConvertTo-Json -Compress)"
+function Invoke-JsonPost {
+  param([string]$Url, $Body, [string]$Token)
+  $Headers = @{}
+  if ($Token) { $Headers['x-bridge-token'] = $Token }
+  $json = $Body | ConvertTo-Json -Depth $Depth
+  Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -ContentType 'application/json' -Body $json -ErrorAction Stop
+}
 
-$srch  = Rpc 'tools/call' @{ name='drive.search'; arguments=@{ query="title contains 'ChatGPT_Transcript_Quill_LoganBot_' and trashed = false"; limit=1 } }
-"drive.search : $($srch | ConvertTo-Json -Compress)"
+function Test-Head {
+  param([string]$Url, [string]$Token)
+  $Headers = @{}
+  if ($Token) { $Headers['x-bridge-token'] = $Token }
+  try {
+    $resp = Invoke-WebRequest -Method Head -Uri $Url -Headers $Headers -ErrorAction Stop
+    return @{ Status = $resp.StatusCode }
+  } catch {
+    try { return @{ Status = $_.Exception.Response.StatusCode.Value__ } }
+    catch { return @{ Status = -1; Error = $_.Exception.Message } }
+  }
+}
+
+Write-Host "» Smoke: $Base"
+
+# health (local + tunnel)
+$localHealth  = Invoke-JsonGet "http://localhost:5050/health" $Token
+Write-Json "Local  /health"  $localHealth
+
+$tunnelHealth = Invoke-JsonGet "$Base/health" $Token
+Write-Json "Tunnel /health" $tunnelHealth
+
+# HEAD /mcp and GET /mcp
+$head = Test-Head "$Base/mcp?token=$Token" $Token
+Write-Json "HEAD /mcp" $head
+
+$get = Invoke-JsonGet "$Base/mcp?token=$Token" $null
+Write-Json "GET  /mcp" $get
+
+# initialize (JSON-RPC 2.0)
+$initBody = [ordered]@{
+  jsonrpc = "2.0"
+  id      = ([Guid]::NewGuid()).ToString("N")
+  method  = "initialize"
+  params  = [ordered]@{
+    protocolVersion = "2024-11-05"
+    capabilities    = @{}
+    clientInfo      = @{ name = "Smoke"; version = "1.0.0" }
+  }
+}
+$init = Invoke-JsonPost "$Base/mcp?token=$Token" $initBody $null
+Write-Json "initialize" $init
+if (-not $init.result.serverInfo) {
+  Write-Warning "Missing serverInfo in initialize → Inspector (Direct) may fail."
+} else {
+  Write-Json "serverInfo" $init.result.serverInfo
+}
+
+# tools/list
+$toolsListBody = @{
+  jsonrpc = "2.0"
+  id      = ([Guid]::NewGuid()).ToString("N")
+  method  = "tools/list"
+  params  = @{}
+}
+$toolsList = Invoke-JsonPost "$Base/mcp?token=$Token" $toolsListBody $null
+Write-Json "tools/list" $toolsList
