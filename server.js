@@ -70,12 +70,21 @@ app.post('/mcp', async (req, res) => {
     res.json({ jsonrpc: '2.0', id: id ?? null, ...(error ? { error } : { result }) });
 
   try {
-    if (method === 'initialize') {
-      return reply({
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-      });
+    // --- initialize handler: ensure serverInfo + proper JSON-RPC envelope ---
+if (rpc?.method === 'initialize') {
+  const result = {
+    protocolVersion: '2024-11-05',
+    // Advertise only what you actually implement. Tools are fine here.
+    capabilities: { tools: {} },
+    // This block is required for Inspector/clients to display server info.
+    serverInfo: {
+      name: 'YFL Drive Bridge',
+      version: process.env.BRIDGE_VERSION || '3.1.1n'
     }
+  };
+  return res.status(200).json({ jsonrpc: '2.0', id: rpc.id ?? null, result });
+}
+
 
     if (method === 'tools/list') {
       return reply({
