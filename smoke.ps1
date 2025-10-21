@@ -1,89 +1,87 @@
+# smoke.ps1  — YFL Drive Bridge smoke for PowerShell 7
 param(
-  [string]$Base = "http://localhost:5050",
-  [string]$Token = ""
+  [Parameter(Mandatory = $true)] [string]$Base,
+  [Parameter(Mandatory = $true)] [string]$Token
 )
 
-$Depth = 12
+$ErrorActionPreference = "Stop"
 
-function Write-Json {
-  param([string]$Label, $Obj)
-  if ($null -eq $Obj) { Write-Host "$Label : <null>"; return }
+function Write-Json([string]$label, $obj) {
+  if ($null -eq $obj) { Write-Host ("{0} : <null>" -f $label); return }
+  if ($obj -is [string]) { Write-Host ("{0} : {1}" -f $label, $obj); return }
+  $json = $obj | ConvertTo-Json -Depth 9
+  Write-Host ($label + " : " + $json)
+}
+
+function Invoke-JsonGet([string]$Url, [hashtable]$Headers) {
   try {
-    Write-Host "$Label : " + ($Obj | ConvertTo-Json -Depth $Depth)
+    return Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop
   } catch {
-    Write-Host "$Label : [unserializable] $_"
+    return $null
   }
 }
 
-function Invoke-JsonGet {
-  param([string]$Url, [string]$Token)
-  $Headers = @{}
-  if ($Token) { $Headers['x-bridge-token'] = $Token }
-  Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop
-}
-
-function Invoke-JsonPost {
-  param([string]$Url, $Body, [string]$Token)
-  $Headers = @{}
-  if ($Token) { $Headers['x-bridge-token'] = $Token }
-  $json = $Body | ConvertTo-Json -Depth $Depth
-  Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -ContentType 'application/json' -Body $json -ErrorAction Stop
-}
-
-function Test-Head {
-  param([string]$Url, [string]$Token)
-  $Headers = @{}
-  if ($Token) { $Headers['x-bridge-token'] = $Token }
+function Invoke-Head([string]$Url, [hashtable]$Headers) {
   try {
-    $resp = Invoke-WebRequest -Method Head -Uri $Url -Headers $Headers -ErrorAction Stop
-    return @{ Status = $resp.StatusCode }
+    $r = Invoke-WebRequest -Method Head -Uri $Url -Headers $Headers -ErrorAction Stop
+    return @{ Status = [int]$r.StatusCode }
   } catch {
-    try { return @{ Status = $_.Exception.Response.StatusCode.Value__ } }
-    catch { return @{ Status = -1; Error = $_.Exception.Message } }
+    if ($_.Exception.Response) {
+      return @{ Status = [int]$_.Exception.Response.StatusCode }
+    }
+    return @{ Status = -1; Error = $_.Exception.Message }
+  }
+}
+
+function Invoke-JsonPost([string]$Url, [hashtable]$Headers, [hashtable]$Body) {
+  try {
+    $json = ($Body | ConvertTo-Json -Depth 9)
+    return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -ContentType "application/json" -Body $json -ErrorAction Stop
+  } catch {
+    return $null
   }
 }
 
 Write-Host "» Smoke: $Base"
 
-# health (local + tunnel)
-$localHealth  = Invoke-JsonGet "http://localhost:5050/health" $Token
-Write-Json "Local  /health"  $localHealth
+# Local health (assumes bridge runs on 127.0.0.1:5050)
+$local = Invoke-JsonGet "http://127.0.0.1:5050/health" @{}
+Write-Json "Local  /health" $local
 
-$tunnelHealth = Invoke-JsonGet "$Base/health" $Token
-Write-Json "Tunnel /health" $tunnelHealth
+# Tunnel health
+$headers = @{"x-bridge-token" = $Token }
+$tunnel = Invoke-JsonGet "$Base/health" $headers
+Write-Json "Tunnel /health" $tunnel
 
-# HEAD /mcp and GET /mcp
-$head = Test-Head "$Base/mcp?token=$Token" $Token
-Write-Json "HEAD /mcp" $head
+# HEAD /mcp (expect 204)
+$head = Invoke-Head "$Base/mcp?token=$Token" @{}
+Write-Json "HEAD /mcp" ($head | ConvertTo-Json)
 
-$get = Invoke-JsonGet "$Base/mcp?token=$Token" $null
+# GET /mcp (expect {ok:true, transport:"streamable-http"})
+$get = Invoke-JsonGet "$Base/mcp?token=$Token" @{}
 Write-Json "GET  /mcp" $get
 
-# initialize (JSON-RPC 2.0)
+# initialize
 $initBody = [ordered]@{
   jsonrpc = "2.0"
-  id      = ([Guid]::NewGuid()).ToString("N")
+  id      = ([guid]::NewGuid().ToString("N"))
   method  = "initialize"
-  params  = [ordered]@{
-    protocolVersion = "2024-11-05"
-    capabilities    = @{}
-    clientInfo      = @{ name = "Smoke"; version = "1.0.0" }
-  }
+  params  = @{}
 }
-$init = Invoke-JsonPost "$Base/mcp?token=$Token" $initBody $null
+$init = Invoke-JsonPost "$Base/mcp?token=$Token" $headers $initBody
 Write-Json "initialize" $init
-if (-not $init.result.serverInfo) {
+if ($init -and -not $init.result.serverInfo) {
   Write-Warning "Missing serverInfo in initialize → Inspector (Direct) may fail."
 } else {
-  Write-Json "serverInfo" $init.result.serverInfo
+  if ($init) { Write-Json "serverInfo" $init.result.serverInfo }
 }
 
 # tools/list
-$toolsListBody = @{
+$toolsListBody = [ordered]@{
   jsonrpc = "2.0"
-  id      = ([Guid]::NewGuid()).ToString("N")
+  id      = ([guid]::NewGuid().ToString("N"))
   method  = "tools/list"
   params  = @{}
 }
-$toolsList = Invoke-JsonPost "$Base/mcp?token=$Token" $toolsListBody $null
+$toolsList = Invoke-JsonPost "$Base/mcp?token=$Token" $headers $toolsListBody
 Write-Json "tools/list" $toolsList
