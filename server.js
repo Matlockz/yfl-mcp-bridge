@@ -1,152 +1,145 @@
 // server.mjs — YFL Drive Bridge (Streamable HTTP MCP)
-// Node 18+ (global fetch). Run: `node server.mjs`
+// ESM only. Requires Node 18+ (global fetch). Run: `node server.mjs`
 
 import express from "express";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
+// ------------ lightweight env loader (no deps) -----------------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+function loadEnvFrom(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const text = fs.readFileSync(filePath, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      let val = line.slice(eq + 1).trim();
+      // strip matching quotes
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (key && process.env[key] == null) {
+        process.env[key] = val;
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+// Look for .env / env.txt in cwd and alongside this file
+const candidates = [
+  path.resolve(process.cwd(), ".env"),
+  path.resolve(process.cwd(), "env.txt"),
+  path.join(__dirname, ".env"),
+  path.join(__dirname, "env.txt"),
+];
+candidates.forEach(loadEnvFrom);
+
+// ------------ config -----------------
 const app = express();
-
-// ---- Config ---------------------------------------------------------------
 const PORT            = process.env.PORT ? Number(process.env.PORT) : 5050;
 const BRIDGE_TOKEN    = process.env.BRIDGE_TOKEN || process.env.TOKEN || "";
 const BRIDGE_VERSION  = process.env.BRIDGE_VERSION || "3.1.1n";
-
-// GAS web app (Apps Script) — set to your deployed "Web app" URL (exec).
 const GAS_BASE_URL    = process.env.GAS_BASE_URL || process.env.GAS_BASE || "";
-const SHARED_KEY      = process.env.SHARED_KEY || "";
+const SHARED_KEY      = process.env.SHARED_KEY || process.env.GAS_KEY || "";
+const ALLOW_ORIGINS   = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
 
-// CORS / origin allow-list for Inspector (and your tunnel).
-// Comma-separated list. Supports a wildcard for *.trycloudflare.com.
-const ALLOW_ORIGINS   = (process.env.ALLOW_ORIGINS ||
-  "http://localhost:6274, http://localhost:6225, *.trycloudflare.com"
-).split(",").map(s => s.trim()).filter(Boolean);
+// ------------ express setup -----------
+app.set("trust proxy", true);                               // respect CF / proxy headers
+app.use(express.json({ limit: "1mb" }));                    // JSON-RPC bodies
 
-// ---- Express plumbing -----------------------------------------------------
-app.set("trust proxy", true);           // respect CF headers when tunneled
-app.use(express.json({ limit: "1mb" })); // JSON-RPC request bodies
-
-// Strict, minimal CORS with Origin allow-list (see MCP transport security notes).
-app.use((req, res, next) => {
-  const origin = req.headers.origin || "";
-  const okOrigin = ALLOW_ORIGINS.some(rule => {
-    if (!rule) return false;
-    if (rule === "*") return true;
-    if (rule.startsWith("*.")) {
-      const suffix = rule.slice(1); // ".domain"
-      return origin.endsWith(suffix);
-    }
-    return origin === rule;
+// CORS (optional but helps Inspector Direct)
+function isAllowedOrigin(origin) {
+  if (!origin || ALLOW_ORIGINS.length === 0) return false;
+  return ALLOW_ORIGINS.some(pat => {
+    pat = pat.trim();
+    if (!pat) return false;
+    if (pat === "*") return true;
+    if (pat.startsWith("*.")) return origin.endsWith(pat.slice(1));
+    return origin === pat;
   });
-
-  if (origin && okOrigin) {
+}
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Accept, x-bridge-token, Authorization"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "content-type, x-bridge-token");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// ---- Helpers --------------------------------------------------------------
+// ------------ helpers -----------------
 const nowIso = () => new Date().toISOString();
+const ok = (res, payload) => res.type("application/json").send(payload);
 
-const json = (res, body, status = 200) =>
-  res.status(status).type("application/json").send(body);
+function authOK(req) {
+  const token = req.get("x-bridge-token") || req.query.token;
+  return !BRIDGE_TOKEN || token === BRIDGE_TOKEN;
+}
+const deny = (res) => res.status(401).json({ ok: false, error: "missing/invalid token" });
 
-const authed = req =>
-  !BRIDGE_TOKEN ||
-  req.get("x-bridge-token") === BRIDGE_TOKEN ||
-  req.query.token === BRIDGE_TOKEN;
-
-const deny = res => json(res, { ok: false, error: "missing/invalid token" }, 401);
-
+// JSON-RPC envelopes
 const rpcResult = (id, result) => ({ jsonrpc: "2.0", id, result });
 const rpcError  = (id, code, message, data) => {
-  const e = { code, message };
-  if (data !== undefined) e.data = data;
-  return { jsonrpc: "2.0", id, error: e };
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  return { jsonrpc: "2.0", id, error };
 };
 
-// GAS caller (Apps Script Web App: doGet(e) → JSON; one redirect is normal)
 async function gasCall(name, args = {}) {
-  if (!GAS_BASE_URL) {
-    const hint = "Set GAS_BASE_URL to your Apps Script Web App (Deploy → Web app → URL).";
-    throw new Error(`GAS_BASE_URL not configured. ${hint}`);
-  }
+  if (!GAS_BASE_URL) throw new Error("GAS_BASE_URL not configured");
   const u = new URL(GAS_BASE_URL);
+  // GAS doGet(e) reads tool & args & key; returns JSON via ContentService (one redirect is normal)
   u.searchParams.set("tool", name);
   u.searchParams.set("args", JSON.stringify(args));
   if (SHARED_KEY) u.searchParams.set("key", SHARED_KEY);
 
-  const r = await fetch(u.toString(), { method: "GET", headers: { accept: "application/json" } });
+  const r = await fetch(u, { method: "GET", headers: { "accept": "application/json" } });
   const text = await r.text();
   try { return JSON.parse(text); } catch { return text; }
 }
 
-async function gasHealthy() {
-  if (!GAS_BASE_URL) return false;
-  try {
-    const u = new URL(GAS_BASE_URL);
-    u.searchParams.set("echo", "1");
-    if (SHARED_KEY) u.searchParams.set("key", SHARED_KEY);
-    const r = await fetch(u.toString(), { method: "GET" });
-    return r.ok;
-  } catch {
-    return false;
-  }
-}
-
-// ---- Routes ---------------------------------------------------------------
-
-// Health (and whether GAS is reachable)
+// ------------ routes ------------------
+// Health: include whether GAS URL is present
 app.get("/health", async (req, res) => {
-  const gas = await gasHealthy();
-  json(res, { ok: true, gas, version: BRIDGE_VERSION, ts: nowIso() });
+  res.json({ ok: true, gas: Boolean(GAS_BASE_URL), version: BRIDGE_VERSION, ts: nowIso() });
 });
 
-// Light env probe for debugging (never returns secrets)
-app.get("/envcheck", (req, res) => {
-  json(res, {
-    ok: true,
-    version: BRIDGE_VERSION,
-    hasToken: Boolean(BRIDGE_TOKEN),
-    hasGas: Boolean(GAS_BASE_URL),
-    allowOrigins: ALLOW_ORIGINS
-  });
-});
-
-// Transport discovery (MCP); HEAD = 204, GET = transport banner
+// MCP transport discovery
 app.head("/mcp", (req, res) => {
-  if (!authed(req)) return deny(res);
+  if (!authOK(req)) return deny(res);
   res.sendStatus(204);
 });
-
 app.get("/mcp", (req, res) => {
-  if (!authed(req)) return deny(res);
-  json(res, { ok: true, transport: "streamable-http" });
+  if (!authOK(req)) return deny(res);
+  res.json({ ok: true, transport: "streamable-http" });
 });
 
-// JSON‑RPC 2.0 endpoint
+// JSON-RPC 2.0 endpoint
 app.post("/mcp", async (req, res) => {
-  if (!authed(req)) return deny(res);
+  if (!authOK(req)) return deny(res);
 
   const { id = null, method, params = {} } = req.body || {};
-  if (!method) return json(res, rpcError(id, -32600, "Invalid Request: missing method"));
+  if (!method) return ok(res, rpcError(id, -32600, "Invalid Request: missing method"));
 
   try {
-    // initialize
     if (method === "initialize") {
-      return json(res, rpcResult(id, {
+      return ok(res, rpcResult(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "YFL Drive Bridge", version: BRIDGE_VERSION }
+        serverInfo: { name: "YFL Drive Bridge", version: BRIDGE_VERSION },
       }));
     }
 
-    // tools/list (with JSON Schemas for Inspector Via‑Proxy)
     if (method === "tools/list") {
       const tools = [
         {
@@ -158,7 +151,7 @@ app.post("/mcp", async (req, res) => {
               folderId: { type: "string", description: "Google Drive folder ID" },
               path:     { type: "string", description: "Folder path (beacons style). Either path or folderId." },
               pageToken:{ type: "string" },
-              pageSize: { type: "integer", minimum: 1, maximum: 200 }
+              pageSize: { type: "integer", minimum: 1, maximum: 200 },
             }
           },
           outputSchema: {
@@ -223,25 +216,22 @@ app.post("/mcp", async (req, res) => {
           annotations: { readOnlyHint: true }
         }
       ];
-      return json(res, rpcResult(id, { tools }));
+      return ok(res, rpcResult(id, { tools }));
     }
 
-    // tools/call → delegate to GAS
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params || {};
-      if (!name) return json(res, rpcError(id, -32602, "Missing tool name"));
-
+      if (!name) return ok(res, rpcError(id, -32602, "Missing tool name"));
       const out = await gasCall(name, args);
       const text = typeof out === "string" ? out : JSON.stringify(out, null, 2);
-      return json(res, rpcResult(id, { content: [{ type: "text", text }] }));
+      return ok(res, rpcResult(id, { content: [{ type: "text", text }] }));
     }
 
-    // unknown method
-    return json(res, rpcError(id, -32601, `Method not found: ${method}`));
-  } catch (err) {
-    const msg  = err?.message || String(err);
-    const data = err?.stack ? { stack: String(err.stack).split("\n").slice(0, 4).join("\n") } : undefined;
-    return json(res, rpcError(id, -32000, msg, data));
+    return ok(res, rpcError(id, -32601, `Method not found: ${method}`));
+  } catch (e) {
+    const msg  = e?.message || String(e);
+    const data = e?.stack ? { stack: String(e.stack).split("\n").slice(0, 4).join("\n") } : undefined;
+    return ok(res, rpcError(id, -32000, msg, data));
   }
 });
 
