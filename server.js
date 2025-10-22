@@ -1,237 +1,247 @@
 // server.mjs — YFL Drive Bridge (Streamable HTTP MCP)
-// ESM only. Requires Node 18+ (global fetch). Run: `node server.mjs`
+// Node 18+ (global fetch). Run: `node server.mjs`
+// Drop-in replacement: structured tool outputs for MCP Inspector, CORS, env loader.
 
-import express from "express";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import os from "os";
+import express from "express";
 
-// ------------ lightweight env loader (no deps) -----------------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-
-function loadEnvFrom(filePath) {
+// ---- tiny env loader (files are optional) -----------------------------------
+function loadKvFile(p) {
   try {
-    if (!fs.existsSync(filePath)) return;
-    const text = fs.readFileSync(filePath, "utf8");
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) continue;
-      const eq = line.indexOf("=");
-      if (eq <= 0) continue;
-      const key = line.slice(0, eq).trim();
-      let val = line.slice(eq + 1).trim();
-      // strip matching quotes
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      if (key && process.env[key] == null) {
-        process.env[key] = val;
-      }
-    }
-  } catch { /* ignore */ }
+    const txt = fs.readFileSync(p, "utf8");
+    txt.split(/\r?\n/).forEach(line => {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!m) return;
+      const [, k, raw] = m;
+      // strip surrounding quotes if present
+      const v = raw.replace(/^['"]|['"]$/g, "");
+      if (!(k in process.env)) process.env[k] = v;
+    });
+  } catch { /* no-op */ }
 }
+const here = process.cwd();
+loadKvFile(path.join(here, ".env"));
+loadKvFile(path.join(here, "env.txt"));
 
-// Look for .env / env.txt in cwd and alongside this file
-const candidates = [
-  path.resolve(process.cwd(), ".env"),
-  path.resolve(process.cwd(), "env.txt"),
-  path.join(__dirname, ".env"),
-  path.join(__dirname, "env.txt"),
-];
-candidates.forEach(loadEnvFrom);
-
-// ------------ config -----------------
+// ---- config -----------------------------------------------------------------
 const app = express();
-const PORT            = process.env.PORT ? Number(process.env.PORT) : 5050;
-const BRIDGE_TOKEN    = process.env.BRIDGE_TOKEN || process.env.TOKEN || "";
-const BRIDGE_VERSION  = process.env.BRIDGE_VERSION || "3.1.1n";
-const GAS_BASE_URL    = process.env.GAS_BASE_URL || process.env.GAS_BASE || "";
-const SHARED_KEY      = process.env.SHARED_KEY || process.env.GAS_KEY || "";
-const ALLOW_ORIGINS   = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+const PORT = process.env.PORT ? Number(process.env.PORT) : 5050;
+const BRIDGE_TOKEN   = process.env.BRIDGE_TOKEN || process.env.TOKEN || "";
+const BRIDGE_VERSION = process.env.BRIDGE_VERSION || "3.1.1n";
+const GAS_BASE_URL   = process.env.GAS_BASE_URL || process.env.GAS_BASE || "";
+const SHARED_KEY     = process.env.SHARED_KEY || process.env.GAS_KEY || "";
 
-// ------------ express setup -----------
-app.set("trust proxy", true);                               // respect CF / proxy headers
-app.use(express.json({ limit: "1mb" }));                    // JSON-RPC bodies
+const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "")
+  .split(/[,\s]+/).filter(Boolean);
 
-// CORS (optional but helps Inspector Direct)
-function isAllowedOrigin(origin) {
-  if (!origin || ALLOW_ORIGINS.length === 0) return false;
-  return ALLOW_ORIGINS.some(pat => {
-    pat = pat.trim();
-    if (!pat) return false;
-    if (pat === "*") return true;
-    if (pat.startsWith("*.")) return origin.endsWith(pat.slice(1));
-    return origin === pat;
-  });
-}
+// express core
+app.set("trust proxy", true);
+app.use(express.json({ limit: "1mb" }));
+
+// ---- CORS (allow Inspector + trycloudflare when listed) ---------------------
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (isAllowedOrigin(origin)) {
+  const ok =
+    !!origin &&
+    (ALLOW_ORIGINS.includes(origin) ||
+     ALLOW_ORIGINS.includes("*") ||
+     ALLOW_ORIGINS.some(p => p.startsWith("*.") ? origin.endsWith(p.slice(1)) : false));
+  if (ok) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-bridge-token, Authorization");
   }
-  res.setHeader("Access-Control-Allow-Headers", "content-type, x-bridge-token");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// ------------ helpers -----------------
+// ---- helpers ----------------------------------------------------------------
 const nowIso = () => new Date().toISOString();
-const ok = (res, payload) => res.type("application/json").send(payload);
-
-function authOK(req) {
+const deny = (res) => res.status(401).json({ ok: false, error: "missing/invalid token" });
+const authOK = (req) => {
   const token = req.get("x-bridge-token") || req.query.token;
   return !BRIDGE_TOKEN || token === BRIDGE_TOKEN;
-}
-const deny = (res) => res.status(401).json({ ok: false, error: "missing/invalid token" });
-
-// JSON-RPC envelopes
+};
 const rpcResult = (id, result) => ({ jsonrpc: "2.0", id, result });
 const rpcError  = (id, code, message, data) => {
-  const error = { code, message };
-  if (data !== undefined) error.data = data;
-  return { jsonrpc: "2.0", id, error };
+  const err = { code, message };
+  if (data !== undefined) err.data = data;
+  return { jsonrpc: "2.0", id, error: err };
 };
 
+// GAS web-app call: doGet(e) returns JSON via ContentService (one redirect is normal)
 async function gasCall(name, args = {}) {
   if (!GAS_BASE_URL) throw new Error("GAS_BASE_URL not configured");
   const u = new URL(GAS_BASE_URL);
-  // GAS doGet(e) reads tool & args & key; returns JSON via ContentService (one redirect is normal)
   u.searchParams.set("tool", name);
   u.searchParams.set("args", JSON.stringify(args));
   if (SHARED_KEY) u.searchParams.set("key", SHARED_KEY);
-
-  const r = await fetch(u, { method: "GET", headers: { "accept": "application/json" } });
+  const r = await fetch(u.toString(), { method: "GET", headers: { accept: "application/json" } });
   const text = await r.text();
-  try { return JSON.parse(text); } catch { return text; }
+  try {
+    return JSON.parse(text);
+  } catch {
+    // non-JSON responses are still returned (Inspector will see text)
+    return text;
+  }
 }
 
-// ------------ routes ------------------
-// Health: include whether GAS URL is present
+async function gasHealthy() {
+  if (!GAS_BASE_URL) return false;
+  try {
+    const u = new URL(GAS_BASE_URL);
+    u.searchParams.set("echo", "1");
+    if (SHARED_KEY) u.searchParams.set("key", SHARED_KEY);
+    const r = await fetch(u.toString(), { method: "GET" });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ---- MCP: tool catalog (declare output schemas) ------------------------------
+const TOOL_CATALOG = [
+  {
+    name: "drive.list",
+    description: "List files by folder path/ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderId: { type: "string", description: "Google Drive folder ID" },
+        path:     { type: "string", description: "Folder path (beacons style). Either path or folderId." },
+        pageToken:{ type: "string" },
+        pageSize: { type: "integer", minimum: 1, maximum: 200 }
+      }
+    },
+    outputSchema: {
+      type: "object",
+      properties: { ok: { type: "boolean" }, items: { type: "array" } }
+    }
+  },
+  {
+    name: "drive.search",
+    description: "Drive v2 query (e.g., title contains \"…\" and trashed=false)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q:        { type: "string", description: "Drive v2 query string" },
+        pageSize: { type: "integer", minimum: 1, maximum: 200 },
+        pageToken:{ type: "string" }
+      },
+      required: [ "q" ]
+    },
+    outputSchema: { type: "object" }
+  },
+  {
+    name: "drive.get",
+    description: "Get metadata by file id",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: [ "id" ]
+    },
+    outputSchema: { type: "object" }
+  },
+  {
+    name: "drive.export",
+    description: "Export Google Docs/Sheets/Slides or text",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string", description: "File ID to export" },
+        mime: { type: "string", description: "MIME type (e.g., text/plain, text/csv, application/pdf)" }
+      },
+      required: [ "id" ]
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        content: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { type: { type: "string" }, text: { type: "string" } },
+            required: [ "type", "text" ]
+          }
+        }
+      }
+    }
+  }
+];
+
+const toolMap = new Map(TOOL_CATALOG.map(t => [t.name, t]));
+
+// ---- routes -----------------------------------------------------------------
 app.get("/health", async (req, res) => {
-  res.json({ ok: true, gas: Boolean(GAS_BASE_URL), version: BRIDGE_VERSION, ts: nowIso() });
+  const gas = await gasHealthy();
+  res.json({ ok: true, gas, version: BRIDGE_VERSION, ts: nowIso() });
 });
 
-// MCP transport discovery
 app.head("/mcp", (req, res) => {
   if (!authOK(req)) return deny(res);
   res.sendStatus(204);
 });
+
 app.get("/mcp", (req, res) => {
   if (!authOK(req)) return deny(res);
   res.json({ ok: true, transport: "streamable-http" });
 });
 
-// JSON-RPC 2.0 endpoint
 app.post("/mcp", async (req, res) => {
   if (!authOK(req)) return deny(res);
 
   const { id = null, method, params = {} } = req.body || {};
-  if (!method) return ok(res, rpcError(id, -32600, "Invalid Request: missing method"));
+  if (!method) return res.json(rpcError(id, -32600, "Invalid Request: missing method"));
 
   try {
     if (method === "initialize") {
-      return ok(res, rpcResult(id, {
+      return res.json(rpcResult(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "YFL Drive Bridge", version: BRIDGE_VERSION },
+        serverInfo: { name: "YFL Drive Bridge", version: BRIDGE_VERSION }
       }));
     }
 
     if (method === "tools/list") {
-      const tools = [
-        {
-          name: "drive.list",
-          description: "List files by folder path/ID",
-          inputSchema: {
-            type: "object",
-            properties: {
-              folderId: { type: "string", description: "Google Drive folder ID" },
-              path:     { type: "string", description: "Folder path (beacons style). Either path or folderId." },
-              pageToken:{ type: "string" },
-              pageSize: { type: "integer", minimum: 1, maximum: 200 },
-            }
-          },
-          outputSchema: {
-            type: "object",
-            properties: {
-              ok:    { type: "boolean" },
-              items: { type: "array" }
-            }
-          },
-          annotations: { readOnlyHint: true }
-        },
-        {
-          name: "drive.search",
-          description: "Drive v2 query (e.g., title contains \"…\" and trashed=false)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              q:         { type: "string", description: "Drive v2 query string" },
-              pageSize:  { type: "integer", minimum: 1, maximum: 200 },
-              pageToken: { type: "string" }
-            },
-            required: ["q"]
-          },
-          outputSchema: { type: "object" },
-          annotations: { readOnlyHint: true }
-        },
-        {
-          name: "drive.get",
-          description: "Get metadata by file id",
-          inputSchema: {
-            type: "object",
-            properties: { id: { type: "string" } },
-            required: ["id"]
-          },
-          outputSchema: { type: "object" },
-          annotations: { readOnlyHint: true }
-        },
-        {
-          name: "drive.export",
-          description: "Export Google Docs/Sheets/Slides or text",
-          inputSchema: {
-            type: "object",
-            properties: {
-              id:   { type: "string", description: "File ID to export" },
-              mime: { type: "string", description: "MIME type (e.g., text/plain, text/csv, application/pdf)" }
-            },
-            required: ["id"]
-          },
-          outputSchema: {
-            type: "object",
-            properties: {
-              content: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: { type: { type: "string" }, text: { type: "string" } },
-                  required: ["type", "text"]
-                }
-              }
-            }
-          },
-          annotations: { readOnlyHint: true }
-        }
-      ];
-      return ok(res, rpcResult(id, { tools }));
+      const tools = TOOL_CATALOG.map(({ name, description, inputSchema, outputSchema }) => ({
+        name, description, inputSchema, outputSchema, annotations: { readOnlyHint: true }
+      }));
+      return res.json(rpcResult(id, { tools }));
     }
 
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params || {};
-      if (!name) return ok(res, rpcError(id, -32602, "Missing tool name"));
+      if (!name) return res.json(rpcError(id, -32602, "Missing tool name"));
+
+      const spec = toolMap.get(name);
+      if (!spec) return res.json(rpcError(id, -32601, `Unknown tool: ${name}`));
+
       const out = await gasCall(name, args);
+
+      // If tool declares an outputSchema and we have JSON, return structured
+      if (spec.outputSchema) {
+        let obj = out;
+        if (typeof out === "string") {
+          try { obj = JSON.parse(out); } catch { /* keep string */ }
+        }
+        if (obj && typeof obj === "object") {
+          return res.json(rpcResult(id, { content: [ { type: "object", object: obj } ] }));
+        }
+      }
+
+      // Fallback to text content
       const text = typeof out === "string" ? out : JSON.stringify(out, null, 2);
-      return ok(res, rpcResult(id, { content: [{ type: "text", text }] }));
+      return res.json(rpcResult(id, { content: [ { type: "text", text } ] }));
     }
 
-    return ok(res, rpcError(id, -32601, `Method not found: ${method}`));
+    return res.json(rpcError(id, -32601, `Method not found: ${method}`));
   } catch (e) {
-    const msg  = e?.message || String(e);
-    const data = e?.stack ? { stack: String(e.stack).split("\n").slice(0, 4).join("\n") } : undefined;
-    return ok(res, rpcError(id, -32000, msg, data));
+    const msg  = (e && e.message) ? e.message : String(e);
+    const data = (e && e.stack) ? { stack: String(e.stack).split("\n").slice(0, 3).join("\n") } : undefined;
+    return res.json(rpcError(id, -32000, msg, data));
   }
 });
 
