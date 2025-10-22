@@ -1,38 +1,39 @@
 param(
-  [Parameter(Mandatory=$true)][string]$Base,
-  [Parameter(Mandatory=$true)][string]$Token
+  [Parameter(Mandatory=$true)][string]$Base,   # https://<subdomain>.trycloudflare.com
+  [Parameter(Mandatory=$true)][string]$Token  # bridge token
 )
 
-$ErrorActionPreference = "Stop"
-function Write-Json($label, $obj) {
-  $pretty = if ($obj -is [string]) { $obj } else { $obj | ConvertTo-Json -Depth 6 }
-  Write-Host "$label : $pretty"
+function Invoke-JsonGet($Url, $Headers) {
+  try { return Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop }
+  catch { return $null }
 }
 
-# Health (local and tunnel)
-try {
-  $local = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:5050/health" -ErrorAction Stop
-} catch { $local = $null }
-Write-Json "Local  /health" $local
+function Invoke-JsonPost($Url, $Body, $Headers) {
+  try {
+    return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers `
+           -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 20) -ErrorAction Stop
+  } catch { return $null }
+}
 
-try {
-  $tunnel = Invoke-RestMethod -Method Get -Uri "$Base/health" -ErrorAction Stop
-} catch { $tunnel = $null }
-Write-Json "Tunnel /health" $tunnel
+Write-Host "» Smoke: $Base"
+$Headers = @{ "x-bridge-token" = $Token }
 
-# HEAD /mcp
+# Health, local & tunnel
+$local  = Invoke-JsonGet "http://127.0.0.1:5050/health" $Headers
+$tunnel = Invoke-JsonGet "$Base/health" $Headers
+Write-Host "Local  /health : " ($local  | ConvertTo-Json -Depth 6)
+Write-Host "Tunnel /health : " ($tunnel | ConvertTo-Json -Depth 6)
+
+# MCP probes
 try {
-  $r = Invoke-WebRequest -Method Head -Uri "$Base/mcp?token=$Token" -ErrorAction Stop
-  Write-Json "HEAD /mcp" @{ Status = [int]$r.StatusCode }
+  $resp = Invoke-WebRequest -Method Head -Uri "$Base/mcp?token=$Token" -ErrorAction Stop
+  Write-Host "HEAD /mcp : " (@{ Status = [int]$resp.StatusCode } | ConvertTo-Json)
 } catch {
-  Write-Json "HEAD /mcp" @{ Status = 0; Error = $_.Exception.Message }
+  Write-Host "HEAD /mcp : " (@{ Status = 0 } | ConvertTo-Json)
 }
 
-# GET /mcp
-try {
-  $getMcp = Invoke-RestMethod -Method Get -Uri "$Base/mcp?token=$Token" -ErrorAction Stop
-} catch { $getMcp = $null }
-Write-Json "GET  /mcp" $getMcp
+$probe = Invoke-JsonGet "$Base/mcp?token=$Token" $Headers
+Write-Host "GET  /mcp : " ($probe | ConvertTo-Json -Depth 6)
 
 # initialize
 $initBody = [ordered]@{
@@ -41,12 +42,10 @@ $initBody = [ordered]@{
   method  = "initialize"
   params  = @{}
 }
-try {
-  $init = Invoke-RestMethod -Method Post -Uri "$Base/mcp?token=$Token" -Body ($initBody | ConvertTo-Json) -ContentType "application/json"
-} catch { $init = $null }
-Write-Json "initialize" $init
-if ($init -and -not $init.result.serverInfo) { Write-Warning "Missing serverInfo in initialize → Inspector (Direct) may fail." }
-if ($init -and $init.result.serverInfo) { Write-Json "serverInfo" $init.result.serverInfo }
+$init = Invoke-JsonPost "$Base/mcp?token=$Token" $initBody $Headers
+Write-Host "initialize : " ($init | ConvertTo-Json -Depth 6)
+if (-not $init.result.serverInfo) { Write-Warning "Missing serverInfo in initialize → Inspector (Direct) may fail." } 
+else { Write-Host  "serverInfo : " ($init.result.serverInfo | ConvertTo-Json) }
 
 # tools/list
 $toolsListBody = @{
@@ -55,7 +54,18 @@ $toolsListBody = @{
   method  = "tools/list"
   params  = @{}
 }
-try {
-  $toolsList = Invoke-RestMethod -Method Post -Uri "$Base/mcp?token=$Token" -Body ($toolsListBody | ConvertTo-Json) -ContentType "application/json"
-} catch { $toolsList = $null }
-Write-Json "tools/list" $toolsList
+$toolsList = Invoke-JsonPost "$Base/mcp?token=$Token" $toolsListBody $Headers
+Write-Host "tools/list : " ($toolsList | ConvertTo-Json -Depth 6)
+
+# tools/call: drive.search
+$callBody = @{
+  jsonrpc = "2.0"
+  id      = ([Guid]::NewGuid()).ToString("N")
+  method  = "tools/call"
+  params  = @{
+    name = "drive.search"
+    arguments = @{ q = 'title contains "Transcripts__INDEX__LATEST" and trashed=false'; pageSize = 5 }
+  }
+}
+$search = Invoke-JsonPost "$Base/mcp?token=$Token" $callBody $Headers
+Write-Host "drive.search : " ($search | ConvertTo-Json -Depth 6)
