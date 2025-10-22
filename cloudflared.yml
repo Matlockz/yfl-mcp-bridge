@@ -1,0 +1,8 @@
+# cloudflared.yml — place in %USERPROFILE%\.cloudflared\cloudflared.yml
+tunnel: yfl-bridge
+credentials-file: C:\Users\<YOU>\.cloudflared\yfl-bridge.json
+
+ingress:
+  - hostname: bridge.<your-zone>
+    service: http://localhost:5050
+  - service: http_status:404
