@@ -1,14 +1,18 @@
 {
   "name": "yfl-mcp-drive-bridge",
   "version": "3.1.1n",
-  "type": "module",
   "private": true,
+  "description": "YFL Drive Bridge — MCP HTTP server for Google Drive tools",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "start:dev": "node server.js",
+    "smoke": "powershell -ExecutionPolicy Bypass -File ./smoke.ps1 -Base https://bridge.yflbridge.work -Token %BRIDGE_TOKEN%"
+  },
+  "engines": {
+    "node": ">=18.17"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0"
   }
