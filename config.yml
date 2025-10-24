@@ -1,10 +1,10 @@
-# config.yml — cloudflared named tunnel
-# Replace TUNNEL_NAME + CREDENTIALS_FILE; add a DNS route in Cloudflare (bridge.yfl-bridge.com) to this tunnel.
-
-tunnel: yfl-bridge
-credentials-file: C:\Windows\System32\config\systemprofile\.cloudflared\REPLACE_WITH_TUNNEL_JSON.json
+# C:\Windows\System32\config\systemprofile\.cloudflared\config.yml
+tunnel: 80a0f5b7-c353-47ab-891b-00846e568e7f
+credentials-file: C:\Windows\System32\config\systemprofile\.cloudflared\80a0f5b7-c353-47ab-891b-00846e568e7f.json
 
 ingress:
+  - hostname: bridge.yflbridge.work
+    service: http://localhost:5050
   - hostname: bridge.yfl-bridge.com
-    service: http://127.0.0.1:5050
+    service: http://localhost:5050
   - service: http_status:404
