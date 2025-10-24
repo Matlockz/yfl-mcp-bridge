@@ -1,18 +1,13 @@
 param(
-  [Parameter(Mandatory=$true)][string]$Base,   # https://<subdomain>.trycloudflare.com
-  [Parameter(Mandatory=$true)][string]$Token  # bridge token
+  [Parameter(Mandatory=$true)][string]$Base,   # e.g., https://bridge.yflbridge.work
+  [Parameter(Mandatory=$true)][string]$Token
 )
 
 function Invoke-JsonGet($Url, $Headers) {
-  try { return Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop }
-  catch { return $null }
+  try { return Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers -ErrorAction Stop } catch { return $null }
 }
-
 function Invoke-JsonPost($Url, $Body, $Headers) {
-  try {
-    return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers `
-           -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 20) -ErrorAction Stop
-  } catch { return $null }
+  try { return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 20) -ErrorAction Stop } catch { return $null }
 }
 
 Write-Host "» Smoke: $Base"
@@ -28,9 +23,7 @@ Write-Host "Tunnel /health : " ($tunnel | ConvertTo-Json -Depth 6)
 try {
   $resp = Invoke-WebRequest -Method Head -Uri "$Base/mcp?token=$Token" -ErrorAction Stop
   Write-Host "HEAD /mcp : " (@{ Status = [int]$resp.StatusCode } | ConvertTo-Json)
-} catch {
-  Write-Host "HEAD /mcp : " (@{ Status = 0 } | ConvertTo-Json)
-}
+} catch { Write-Host "HEAD /mcp : " (@{ Status = 0 } | ConvertTo-Json) }
 
 $probe = Invoke-JsonGet "$Base/mcp?token=$Token" $Headers
 Write-Host "GET  /mcp : " ($probe | ConvertTo-Json -Depth 6)
@@ -44,8 +37,7 @@ $initBody = [ordered]@{
 }
 $init = Invoke-JsonPost "$Base/mcp?token=$Token" $initBody $Headers
 Write-Host "initialize : " ($init | ConvertTo-Json -Depth 6)
-if (-not $init.result.serverInfo) { Write-Warning "Missing serverInfo in initialize → Inspector (Direct) may fail." } 
-else { Write-Host  "serverInfo : " ($init.result.serverInfo | ConvertTo-Json) }
+if ($init -and $init.result -and $init.result.serverInfo) { Write-Host  "serverInfo : " ($init.result.serverInfo | ConvertTo-Json) }
 
 # tools/list
 $toolsListBody = @{
@@ -57,7 +49,7 @@ $toolsListBody = @{
 $toolsList = Invoke-JsonPost "$Base/mcp?token=$Token" $toolsListBody $Headers
 Write-Host "tools/list : " ($toolsList | ConvertTo-Json -Depth 6)
 
-# tools/call: drive.search
+# tools/call: drive.search (v2 title/trashed=false)
 $callBody = @{
   jsonrpc = "2.0"
   id      = ([Guid]::NewGuid()).ToString("N")
