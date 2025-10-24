@@ -1,81 +1,85 @@
-/**
- * server.js — YFL Drive Bridge (Streamable HTTP for MCP)
- * - /health : diagnostics
- * - /mcp    : HEAD=204, GET=transport banner, POST=JSON-RPC 2.0 (initialize, tools/list, tools/call)
- *
- * Requires Node 18+ (global fetch). Reads .env for config.
- */
+// server.js — YFL Drive Bridge (CommonJS) — v3.1.1n
+// Endpoints: /health (public), /mcp (HEAD/GET/POST; token required)
+// Tools: drive.search, drive.list, drive.get, drive.export (GAS-backed)
 
 const express = require('express');
-const crypto = require('crypto');
+const morgan = require('morgan');
 
-const {
-  PORT = 5050,
-  BRIDGE_VERSION = '3.4.5',
-  BRIDGE_TOKEN = '',
-  GAS_BASE_URL = '',
-  GAS_KEY = '',
-  ALLOW_ORIGINS = '',
-  ALLOW_HEADERS = 'content-type,x-bridge-token,x-custom-auth-headers,authorization,x-mcp-auth',
-  ALLOW_METHODS = 'GET,POST,HEAD,OPTIONS',
-} = process.env;
+const VERSION = process.env.BRIDGE_VERSION || '3.1.1n';
+const PORT = Number(process.env.PORT || 5050);
 
-const allowedOrigins = ALLOW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
-const app = express();
+// GAS web app (deployed as “Anyone with the link”), v2 Drive semantics
+const GAS_BASE_URL = process.env.GAS_BASE_URL || '';
+const GAS_KEY      = process.env.GAS_KEY || '';
+const SHARED_KEY   = process.env.SHARED_KEY || '';
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
 
-// ---- minimal CORS with allow-list (emit ONE origin per request) ----
-app.use((req, res, next) => {
+// CORS allow list (comma-separated), headers & methods
+const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const ALLOW_HEADERS = process.env.ALLOW_HEADERS || 'content-type,x-bridge-token,x-custom-auth-headers,authorization,x-mcp-auth';
+const ALLOW_METHODS = process.env.ALLOW_METHODS || 'GET,POST,HEAD,OPTIONS';
+
+// Helpers
+function allowOrigin(origin) {
+  if (!origin) return null;
+  if (ALLOW_ORIGINS.includes('*')) return '*';
+  return ALLOW_ORIGINS.find(allowed => {
+    if (allowed.startsWith('*.')) {
+      const suffix = allowed.slice(1); // ".example.com"
+      return origin.endsWith(suffix);
+    }
+    return allowed === origin;
+  }) || null;
+}
+
+function cors(req, res, next) {
   const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+  const allowed = allowOrigin(origin);
+  if (allowed || allowed === '*') {
+    res.setHeader('Access-Control-Allow-Origin', allowed || origin);
     res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', ALLOW_METHODS);
+    res.setHeader('Access-Control-Allow-Headers', ALLOW_HEADERS);
   }
-  res.setHeader('Access-Control-Allow-Methods', ALLOW_METHODS);
-  res.setHeader('Access-Control-Allow-Headers', ALLOW_HEADERS);
-  // (No credentials; if you add them, avoid wildcard origins)
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
-});
-
-// ---- body parsing for JSON-RPC ----
-app.use(express.json({ limit: '4mb' }));
-
-// ---- auth gate (x-bridge-token header OR ?token=...) ----
-function isAuthorized(req) {
-  if (!BRIDGE_TOKEN) return true;
-  const header = req.headers['x-bridge-token'] || req.headers['x_mcp_auth'] || '';
-  const query = req.query.token || '';
-  return header === BRIDGE_TOKEN || query === BRIDGE_TOKEN;
 }
 
-// ---- helpers ----
-function banner() {
-  return { ok: true, transport: 'streamable-http' };
-}
-function nowIso() { return new Date().toISOString(); }
+function ts() { return new Date().toISOString(); }
 
-async function callGASTool(name, args) {
-  if (!GAS_BASE_URL) {
-    throw new Error('GAS_BASE_URL is not set');
-  }
+function json(id, result) {
+  return { jsonrpc: '2.0', id: String(id || '1'), result };
+}
+
+function jsonError(id, code, message, data) {
+  return { jsonrpc: '2.0', id: String(id || '1'), error: { code, message, data } };
+}
+
+function authOk(req) {
+  const token = (req.headers['x-bridge-token'] || req.query.token || '').toString();
+  return BRIDGE_TOKEN && token && token === BRIDGE_TOKEN;
+}
+
+async function gasCall(tool, args) {
+  if (!GAS_BASE_URL) throw new Error('GAS_BASE_URL not configured');
   const url = new URL(GAS_BASE_URL);
-  url.searchParams.set('tool', name);
+  url.searchParams.set('tool', tool);
   url.searchParams.set('args', JSON.stringify(args || {}));
-  const headers = {};
-  if (GAS_KEY) headers['x-api-key'] = GAS_KEY;
+  if (GAS_KEY) url.searchParams.set('key', GAS_KEY);
+  if (SHARED_KEY) url.searchParams.set('shared', SHARED_KEY);
 
-  const resp = await fetch(url.toString(), { method: 'GET', headers });
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`GAS ${name} failed: ${resp.status} ${txt.slice(0,200)}`);
+  const r = await fetch(url.toString(), { method: 'GET' });
+  if (!r.ok) {
+    const text = await r.text().catch(()=>'');
+    throw new Error(`GAS ${tool} failed: ${r.status} ${text.slice(0,200)}`);
   }
-  return await resp.json();
+  const data = await r.json();
+  if (!data || data.ok === false) throw new Error(`GAS ${tool} error: ${JSON.stringify(data)}`);
+  return data;
 }
 
-// ---- JSON-RPC responders ----
-const protocolVersion = '2024-11-05';
-
-const tools = [
+// Tool registry (Inspector-friendly)
+const TOOLS = [
   {
     name: 'drive.list',
     description: 'List files by folder path/ID',
@@ -83,21 +87,17 @@ const tools = [
       type: 'object',
       properties: {
         folderId: { type: 'string', description: "Drive folder ID (or 'root')" },
-        path:     { type: 'string', description: 'Folder path (optional; may be ignored)' },
+        path:     { type: 'string', description: 'Folder path (optional; server may ignore)' },
         pageToken:{ type: 'string' },
-        pageSize: { type: 'integer', minimum: 1, maximum: 200 },
-      },
+        pageSize: { type: 'integer', minimum: 1, maximum: 200 }
+      }
     },
     outputSchema: {
       type: 'object',
-      properties: {
-        ok: { type: 'boolean' },
-        items: { type: 'array' },
-        nextPageToken: { type: 'string' },
-      },
-      required: ['ok', 'items'],
+      properties: { ok: { type: 'boolean' }, items: { type:'array' }, nextPageToken: { type:'string' } },
+      required: ['ok','items']
     },
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true }
   },
   {
     name: 'drive.search',
@@ -105,114 +105,107 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        q: { type: 'string', description: 'Drive v2 q string' },
-        query: { type: 'string', description: 'Alias of q' },
-        pageToken: { type: 'string' },
-        pageSize: { type: 'integer', minimum: 1, maximum: 200 },
+        q:     { type:'string', description:'Drive v2 search query' },
+        query: { type:'string', description:'Alias of q' },
+        pageToken:{ type:'string' },
+        pageSize: { type:'integer', minimum:1, maximum:200 }
       },
-      required: ['q'],
+      required: ['q']
     },
     outputSchema: {
       type: 'object',
-      properties: { ok: { type: 'boolean' }, items: { type: 'array' }, nextPageToken: { type: 'string' } },
-      required: ['ok', 'items'],
+      properties: { ok: {type:'boolean'}, items:{type:'array'}, nextPageToken:{type:'string'} },
+      required: ['ok','items']
     },
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true }
   },
   {
     name: 'drive.get',
     description: 'Get metadata by file id',
-    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
-    outputSchema: { type: 'object' },
-    annotations: { readOnlyHint: true },
+    inputSchema: { type:'object', properties:{ id:{type:'string'} }, required:['id'] },
+    outputSchema: { type:'object' },
+    annotations: { readOnlyHint: true }
   },
   {
     name: 'drive.export',
     description: 'Export Google Docs/Sheets/Slides or text',
     inputSchema: {
-      type: 'object',
+      type:'object',
       properties: {
-        id: { type: 'string', description: 'File ID' },
-        mime: { type: 'string', description: 'MIME (e.g., text/plain, text/csv, application/pdf)' },
+        id:   { type:'string', description:'File ID' },
+        mime: { type:'string', description:'MIME (e.g., text/plain, text/csv, application/pdf)' }
       },
-      required: ['id'],
+      required:['id']
     },
     outputSchema: {
-      type: 'object',
+      type:'object',
       properties: {
-        ok: { type: 'boolean' },
-        id: { type: 'string' },
-        srcMime: { type: 'string' },
-        mime: { type: 'string' },
-        size: { type: 'integer' },
-        text: { type: 'string' },
+        ok:{type:'boolean'}, id:{type:'string'}, srcMime:{type:'string'},
+        mime:{type:'string'}, size:{type:'integer'}, text:{type:'string'}
       },
-      required: ['ok', 'id', 'mime', 'text'],
+      required: ['ok','id','mime','text']
     },
-    annotations: { readOnlyHint: true },
-  },
+    annotations: { readOnlyHint: true }
+  }
 ];
 
-// health
-app.get('/health', (req, res) => {
-  res.json({ ok: true, gas: !!GAS_BASE_URL, version: BRIDGE_VERSION, ts: nowIso() });
+// App
+const app = express();
+app.disable('x-powered-by');
+app.use(morgan('tiny'));
+app.use(express.json({ limit: '5mb' }));
+app.use(cors);
+
+// Public health
+app.get('/health', (req,res) => {
+  res.json({ ok:true, gas: Boolean(GAS_BASE_URL), version: VERSION, ts: ts() });
 });
 
-// mcp banners
-app.head('/mcp', (req, res) => res.status(204).end());
-app.get('/mcp', (req, res) => res.json(banner()));
+// MCP transport probe (token required)
+app.head('/mcp', (req,res) => {
+  if (!authOk(req)) return res.status(401).end();
+  return res.status(204).end();
+});
 
-// mcp json-rpc
-app.post('/mcp', async (req, res) => {
-  if (!isAuthorized(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+app.get('/mcp', (req,res) => {
+  if (!authOk(req)) return res.status(401).json({ ok:false, error:'unauthorized' });
+  return res.json({ ok:true, transport:'streamable-http' });
+});
 
-  const { method, id, params } = req.body || {};
+// JSON-RPC 2.0
+app.post('/mcp', async (req,res) => {
   try {
+    if (!authOk(req)) return res.status(401).json(jsonError(req.body?.id, -32001, 'unauthorized'));
+    const { id, method, params } = req.body || {};
     if (method === 'initialize') {
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          protocolVersion,
-          capabilities: { tools: {} },
-          serverInfo: { name: 'YFL Drive Bridge', version: BRIDGE_VERSION },
-        },
-      });
+      return res.json(json(id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'YFL Drive Bridge', version: VERSION }
+      }));
     }
-
     if (method === 'tools/list') {
-      return res.json({ jsonrpc: '2.0', id, result: { tools } });
+      return res.json(json(id, { tools: TOOLS }));
     }
-
     if (method === 'tools/call') {
       const name = params?.name;
       const args = params?.arguments || {};
-      if (!name) throw new Error('tools/call requires name');
+      let out;
+      if (name === 'drive.search') out = await gasCall('drive.search', { q: args.q || args.query, pageSize: args.pageSize, pageToken: args.pageToken });
+      else if (name === 'drive.list') out = await gasCall('drive.list', args);
+      else if (name === 'drive.get') out = await gasCall('drive.get', args);
+      else if (name === 'drive.export') out = await gasCall('drive.export', args);
+      else return res.json(jsonError(id, -32601, `Unknown tool ${name}`));
 
-      // Proxy to GAS
-      const obj = await callGASTool(name, args);
-
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          content: [{ type: 'object', object: obj }],
-        },
-      });
+      // Inspector-friendly content envelope
+      return res.json(json(id, { content: [ { type:'object', object: out } ] }));
     }
-
-    return res.status(400).json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+    return res.json(jsonError(id, -32601, `Unknown method ${method}`));
   } catch (err) {
-    return res.status(200).json({
-      jsonrpc: '2.0',
-      id,
-      error: { code: -32000, message: String(err?.message || err || 'Unknown error') },
-    });
+    return res.json(jsonError(req.body?.id, -32000, String(err && err.message || err), { stack: String(err && err.stack || '') }));
   }
 });
 
-// start
-app.listen(Number(PORT), () => {
-  // eslint-disable-next-line no-console
-  console.log(`[bridge] v${BRIDGE_VERSION} listening on :${PORT}`);
+app.listen(PORT, () => {
+  console.log(`YFL Drive Bridge listening on ${PORT}`);
 });
