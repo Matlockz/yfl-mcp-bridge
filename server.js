@@ -1,6 +1,7 @@
 // server.mjs — YFL Drive Bridge (Streamable HTTP MCP)
 // Node 18+ (global fetch). Run: `node server.mjs`
 // CORS aware; JSON-RPC 2.0; returns structured object content for tools.
+import 'dotenv/config';
 
 import express from "express";
 
