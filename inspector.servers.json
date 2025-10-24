@@ -1,8 +1,12 @@
 {
-  "mcpServers": {
-    "YFL Local Bridge": {
-      "type": "http",
-      "url": "http://localhost:10000/mcp?token=v3c3NJQ4i94"
+  "servers": [
+    {
+      "name": "YFL Drive Bridge",
+      "transport": "streamable-http",
+      "serverUrl": "https://bridge.yfl-bridge.com/mcp?token=v3c3NJQ4i94",
+      "headers": {
+        "x-bridge-token": "v3c3NJQ4i94"
+      }
     }
-  }
+  ]
 }
