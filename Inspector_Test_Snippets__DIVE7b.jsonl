@@ -1,0 +1,8 @@
+{"name":"drive.search","arguments":{"q":"title contains 'Transcripts__INDEX__LATEST.csv' and trashed=false","pageSize":5}}
+{"name":"drive.get","arguments":{"id":"<REPLACE_WITH_FIRST_ID_FROM_SEARCH>"}}
+{"name":"drive.export","arguments":{"id":"<REPLACE_WITH_FIRST_ID_FROM_SEARCH>","mime":"text/csv"}}
+{"name":"drive.search","arguments":{"q":"title contains 'Transcripts__INDEX__LATEST.csv' and trashed=false","pageSize":2}}
+{"name":"drive.export","arguments":{"id":"<OPTIONAL_GOOGLE_DOC_ID>","mime":"text/plain"}}
+{"name":"drive.search","arguments":{}}
+{"name":"drive.get","arguments":{"id":"bad-id"}}
+{"name":"drive.search","arguments":{"q":"title contains 'Transcripts__INDEX__LATEST.csv' and trashed=false","pageSize":9999}}
