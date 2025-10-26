@@ -5,7 +5,7 @@
   "description": "YFL Drive Bridge — MCP HTTP server for Google Drive tools",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node -r dotenv/config server.js",
     "start:dev": "node server.js",
     "smoke": "powershell -ExecutionPolicy Bypass -File ./smoke.ps1 -Base https://bridge.yflbridge.work -Token %BRIDGE_TOKEN%"
   },
