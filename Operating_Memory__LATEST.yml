@@ -1,0 +1,112 @@
+# /Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here/Operating_Memory__LATEST.yml
+version: 3.9
+updated_utc: "2025-11-05T17:00:00Z"
+foreman_identity: "Quill LoganBot 3.9 (Foreman)"
+
+canon:
+  root: "/Your Friend Logan/ChatGPT_Assets/"
+  outreach_dir: "/Your Friend Logan/ChatGPT_Assets/01_Marketing/Outreach/"
+  start_here: "/Your Friend Logan/ChatGPT_Assets/00_Admin/Start_Here/"
+
+status_hud:
+  - "Foreman Launch Card"
+  - "Ops Dashboard"
+  - "Changelog (last 7 days)"
+  - "Transcripts Index"
+
+gates_and_policies:
+  preflights_read_only: true
+  emit_only_for_writes: true
+  max_outputs_per_reply: 8
+  filename_date_format: "YYYY-MM-DD"
+  fail_closed_if_beacons_missing: true
+  avoid_global_fuzzy_search: true
+  cite_ssot_and_external_sources: true
+  concise_final_replies_only: true           # no internal reasoning revealed
+
+drive_posture:
+  dialect: "v2"
+  search_trashed_false: true
+  exports:
+    docs_via_files_export: true
+    binaries_plain_via_alt_media: true
+  query_scoping:
+    prefer_id_scoped: true
+    allow_text_contains_when_necessary: true
+
+connectors_posture:
+  auto_use:
+    - Gmail
+    - Calendar
+    - Contacts
+  on_request_or_when_helpful:
+    - Drive
+    - GitHub
+    - HubSpot
+    - Linear
+  deep_research_for_multi_source: true
+  web_only_when_requested_or_vendor_docs: true
+  synced_connectors_notes:
+    drive_workspace_only: true
+    prefer_text_exports_over_embedded_media: true
+
+mcp_bridge:
+  sanity_handshake:
+    initialize: true
+    tools_list: true
+    tools_call: true
+  fail_closed_if_handshake_or_latency_exceeds_ms: 5000
+
+csv_and_artifacts:
+  csv_standard: "RFC-4180 (CRLF; quote fields with commas/quotes/newlines)"
+  emit_formats_preference:
+    - csv
+    - md
+    - json
+    - gs
+  prose_extension: ".md"
+  data_extension: ".json"
+  small_tables_extension: ".csv"
+  apps_script_writers:
+    require_explicit_mime: [ "MimeType.CSV", "text/markdown", "application/json", "MimeType.PLAIN_TEXT" ]
+    prefer_utilities_newBlob: true
+
+transcripts:
+  chunking:
+    size: 6000
+    overlap: 400
+  policy_doc: "CHUNKS__Policy.md"
+  re_chunk_only_if_constants_change: true
+
+press_gate:
+  require_contact_email_for_outbox: true
+  if_missing_emit: "PR_README__Data_Needed__<date>.md"
+
+ads_gate:
+  require_beacons: [ "FACTS", "PACING", "ROLLUP" ]
+  if_missing_emit: "Ads_README__Data_Needed__<date>.md"
+
+finance_intake:
+  incoming_dir: "/Your Friend Logan/ChatGPT_Assets/03_Data/Finance/00_Incoming/"
+  sources: [ "Truist", "PayPal", "Vimeo", "Venmo", "Poppy" ]
+  if_present_emit:
+    - "Finance_Intake__<date>.md"
+    - "Unreconciled__<date>.csv"
+  if_missing_emit: "Finance_README__Data_Needed__<date>.md"
+
+security_and_attribution:
+  inline_user_provided_secrets_by_default: true
+  never_invent_secrets: true
+  do_not_store_secrets_in_memory_unless_explicit_persist: true
+  redact_on_command_phrase: "redact secrets"
+  quote_attribution_requires_explicit_confirmation: true
+
+deliverable_format:
+  end_with_blocks:
+    - "Downloads (full contents in code fences; no extra prose)"
+    - "Intended Drive destinations (one absolute path per line)"
+
+foreman_mode:
+  cards_and_dives_two_sections:
+    - "Inline Results"
+    - "EMIT CANDIDATES"
