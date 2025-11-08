@@ -1,12 +1,12 @@
 {
   "name": "yfl-mcp-drive-bridge",
-  "version": "3.2.1",
-  "private": true,
-  "type": "commonjs",
+  "version": "3.2.2",
+  "type": "module",
   "scripts": {
     "start": "node -r dotenv/config server.js",
     "start:sse": "node sse-gateway.js"
-  },
+  }
+},
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
