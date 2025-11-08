@@ -1,13 +1,7 @@
-# C:\Windows\System32\config\systemprofile\.cloudflared\config.yml
-# Named Tunnel: yfl-bridge (UUID: 80a0f5b7-c353-47ab-891b-00846e568e7f)
-# Service runs with: cloudflared.exe tunnel run --token <JWT>
-# Public hostname to this tunnel is managed via Cloudflare (route dns).
-# We keep ingress simple; the public hostname mapping is handled by DNS + Tunnel.
-
+# ~/.cloudflared/config.yml
 tunnel: 80a0f5b7-c353-47ab-891b-00846e568e7f
-
+credentials-file: C:\Users\matlo\.cloudflared\80a0f5b7-c353-47ab-891b-00846e568e7f.json
 ingress:
-  - service: http://localhost:5050
+  - hostname: bridge.yflbridge.work
+    service: http://127.0.0.1:5051
   - service: http_status:404
-
-loglevel: info
