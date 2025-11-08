@@ -5,8 +5,7 @@
   "scripts": {
     "start": "node -r dotenv/config server.js",
     "start:sse": "node sse-gateway.js"
-  }
-},
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
