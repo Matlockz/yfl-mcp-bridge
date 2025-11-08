@@ -1,24 +1,65 @@
-// sse-gateway.js — YFL Bridge SSE/HTTP front door (CommonJS)
+// sse-gateway.js  — YFL MCP SSE gateway (CJS, no frameworks)
+// Listens on :5051 and fronts your Express bridge on :5050.
+// - GET  /mcp?token=...      -> SSE handshake (text/event-stream)
+// - POST /mcp?token=...      -> JSON-RPC pass-through to :5050/mcp
+// - OPTIONS/HEAD supported    -> CORS & liveness for Connector UI
+
 const http = require('http');
 const { URL } = require('url');
+const { request: httpRequest } = require('http');
 
-// Config
-const PORT = Number(process.env.SSE_PORT || 5051);
-const UPSTREAM = process.env.UPSTREAM_URL || 'http://127.0.0.1:5050/mcp';
-// You asked for the exact token to be embedded:
-const TOKEN = (process.env.BRIDGE_TOKEN || 'v3c3NJQ4i94').trim();
-// Allow ChatGPT UI + platform
-const ALLOW = (process.env.CORS_ALLOW_ORIGINS ||
-  'https://chatgpt.com,https://chat.openai.com,https://platform.openai.com,*'
-).split(',').map(s => s.trim());
+const PORT = process.env.SSE_PORT ? Number(process.env.SSE_PORT) : 5051;
+const BRIDGE_PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 5050;
+const TOKEN = process.env.BRIDGE_TOKEN || 'v3c3NJQ4i94';
 
-function allowOrigin(origin) {
-  if (!origin) return '*';
-  if (ALLOW.includes('*')) return '*';
-  return ALLOW.includes(origin) ? origin : '';
+// Allowed browser origins for Connector UI
+const ALLOW_ORIGINS = new Set([
+  'https://chatgpt.com',
+  'https://platform.openai.com',       // safety: some flows originate here
+]);
+
+function corsHeaders(origin) {
+  const allowOrigin = ALLOW_ORIGINS.has(origin) ? origin : 'https://chatgpt.com';
+  return {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD',
+    'Access-Control-Allow-Headers': 'content-type,authorization,x-bridge-token,x-custom-auth-headers',
+    'Vary': 'Origin',
+  };
 }
 
-function sendSseHello(res) {
+function unauthorized(res, origin) {
+  const h = corsHeaders(origin);
+  res.writeHead(401, { ...h, 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Unauthorized' }, id: null }));
+}
+
+function notAcceptable(res, origin) {
+  const h = corsHeaders(origin);
+  res.writeHead(406, { ...h, 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Not Acceptable: Client must accept both application/json and text/event-stream' },
+    id: null
+  }));
+}
+
+function okJson(res, origin, bodyObj) {
+  const h = corsHeaders(origin);
+  res.writeHead(200, { ...h, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(bodyObj));
+}
+
+function sseHello(res, origin) {
+  const h = corsHeaders(origin);
+  res.writeHead(200, {
+    ...h,
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
   const hello = {
     jsonrpc: '2.0',
     id: '0',
@@ -28,108 +69,94 @@ function sendSseHello(res) {
       serverInfo: { name: 'YFL Bridge (SSE gateway)', version: 'sse-1.0' }
     }
   };
-  res.write(`event: message\n`);
-  res.write(`data: ${JSON.stringify(hello)}\n\n`);
+  res.write(`event: message\ndata: ${JSON.stringify(hello)}\n\n`);
+  // keepalive every 10s
+  const timer = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 10000);
+  res.on('close', () => clearInterval(timer));
+}
+
+function passThroughJsonRpc(req, res, origin) {
+  // Proxy JSON-RPC POST to the local Express bridge on :5050
+  let body = '';
+  req.on('data', chunk => (body += chunk));
+  req.on('end', () => {
+    const opts = {
+      hostname: '127.0.0.1',
+      port: BRIDGE_PORT,
+      path: '/mcp',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Connection': 'keep-alive'
+      }
+    };
+    const p = httpRequest(opts, (up) => {
+      let resp = '';
+      up.setEncoding('utf8');
+      up.on('data', (c) => (resp += c));
+      up.on('end', () => {
+        const h = corsHeaders(origin);
+        res.writeHead(200, { ...h, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(resp);
+      });
+    });
+    p.on('error', (err) => {
+      const h = corsHeaders(origin);
+      res.writeHead(502, { ...h, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: `Upstream error: ${err.message}` }, id: null }));
+    });
+    p.write(body);
+    p.end();
+  });
 }
 
 const server = http.createServer((req, res) => {
+  const origin = req.headers.origin || '';
   const u = new URL(req.url, `http://${req.headers.host}`);
+  const isMcpPath = u.pathname === '/mcp';
+  const token = u.searchParams.get('token') || req.headers['x-bridge-token'];
 
   // CORS preflight
   if (req.method === 'OPTIONS') {
-    const origin = req.headers.origin || '';
-    const allow = allowOrigin(origin);
-    if (allow) res.setHeader('Access-Control-Allow-Origin', allow);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,HEAD,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,X-Bridge-Token');
-    res.setHeader('Access-Control-Max-Age', '600');
+    const h = corsHeaders(origin);
+    res.writeHead(204, h);
     return res.end();
   }
 
-  // HEAD /mcp — fast health (no auth; connectors often HEAD first)
-  if (req.method === 'HEAD' && u.pathname === '/mcp') {
-    res.statusCode = 200;
-    res.setHeader('Cache-Control', 'no-store');
-    return res.end();
+  // HEAD for liveness
+  if (req.method === 'HEAD' && isMcpPath) {
+    const h = corsHeaders(origin);
+    res.writeHead(200, { ...h, 'Content-Type': 'text/plain' });
+    return res.end('OK');
   }
 
-  // Auth — query ?token= or Authorization: Bearer
-  const qpToken = u.searchParams.get('token');
-  const hdr = (req.headers['x-bridge-token'] || req.headers['authorization'] || '').trim();
-  const hdrToken = hdr.startsWith('Bearer ') ? hdr.slice(7) : (hdr || '');
-  const token = qpToken || hdrToken;
-  if (TOKEN && token !== TOKEN) {
-    res.statusCode = 401;
-    res.setHeader('Content-Type', 'application/json');
-    return res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null }));
+  if (!isMcpPath) {
+    const h = corsHeaders(origin);
+    res.writeHead(404, { ...h, 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
   }
 
-  // GET /mcp — keep an SSE stream open (hello + pings), even if upstream restarts
-  if (req.method === 'GET' && u.pathname === '/mcp') {
-    const origin = req.headers.origin || '';
-    const allow = allowOrigin(origin);
-    if (allow) res.setHeader('Access-Control-Allow-Origin', allow);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
+  if (!token || token !== TOKEN) return unauthorized(res, origin);
 
-    sendSseHello(res);
-    const ping = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 25000);
-    req.on('close', () => clearInterval(ping));
-    return;
+  if (req.method === 'GET') {
+    // For GET, require ability to accept SSE (Connector UI does)
+    const accept = String(req.headers.accept || '');
+    if (!accept.includes('text/event-stream')) return notAcceptable(res, origin);
+    return sseHello(res, origin);
   }
 
-  // POST /mcp — proxy JSON-RPC to upstream (server.js @ 5050)
-  if (req.method === 'POST' && u.pathname === '/mcp') {
-    let body = '';
-    req.on('data', chunk => (body += chunk));
-    req.on('end', () => {
-      const up = new URL(UPSTREAM);
-      const upReq = http.request(
-        {
-          hostname: up.hostname,
-          port: up.port,
-          path: up.pathname + up.search,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            // Forward Accept as-is; if client only sends JSON, that’s fine.
-            'Accept': req.headers.accept || 'application/json',
-            'Connection': 'keep-alive'
-          }
-        },
-        upRes => {
-          const origin = req.headers.origin || '';
-          const allow = allowOrigin(origin);
-          if (allow) upRes.headers['access-control-allow-origin'] = allow;
-          upRes.headers['cache-control'] = 'no-store';
-          res.writeHead(upRes.statusCode || 200, upRes.headers);
-          upRes.pipe(res);
-        }
-      );
-
-      upReq.on('error', err => {
-        res.statusCode = 502;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
-          jsonrpc: '2.0',
-          error: { code: -32098, message: `Upstream error: ${err.message}` },
-          id: null
-        }));
-      });
-
-      upReq.write(body || '');
-      upReq.end();
-    });
-    return;
+  if (req.method === 'POST') {
+    // For POST, clients often send Accept: "application/json, text/event-stream"
+    const accept = String(req.headers.accept || '');
+    if (!accept.includes('application/json')) return notAcceptable(res, origin);
+    return passThroughJsonRpc(req, res, origin);
   }
 
-  res.statusCode = 404;
-  res.setHeader('Content-Type', 'text/plain');
-  res.end('Not Found');
+  const h = corsHeaders(origin);
+  res.writeHead(405, { ...h, 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: false, error: 'Method Not Allowed' }));
 });
 
 server.listen(PORT, () => {
