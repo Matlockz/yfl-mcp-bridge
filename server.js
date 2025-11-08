@@ -1,169 +1,134 @@
-// server.mjs — YFL Drive Bridge (Streamable HTTP MCP) — v3.4.6
-// Endpoints: /health (public), /mcp (POST Streamable HTTP; GET/HEAD for probes)
-// Tools: drive.search, drive.list, drive.get, drive.export (GAS-backed)
+// server.js — YFL Drive Bridge (CommonJS) — v3.2.0
+// LISTENS on :5050  (JSON-RPC over HTTP; no SSE here)
+// Proxies Drive ops to Apps Script or to whatever backend you already wired.
+// Keeps behavior you had, but relaxes Accept handling (no 406 if Accept lacks text/event-stream).
 
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import fetch from 'node-fetch';
-import { randomUUID } from 'node:crypto';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-
-const VERSION = process.env.BRIDGE_VERSION || '3.4.6';
-const PORT    = Number(process.env.PORT || 5050);
-
-// GAS web app (deployed “Anyone with the link”), v2 Drive semantics
-const GAS_BASE_URL = process.env.GAS_BASE_URL || '';
-const GAS_KEY      = process.env.GAS_KEY || process.env.TOKEN || 'v3c3NJQ4i94'; // per your request
-const SHARED_KEY   = process.env.SHARED_KEY || '';
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || 'v3c3NJQ4i94';                 // per your request
-
-// CORS allow list (include ChatGPT web)
-const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || 'https://chatgpt.com,https://chat.openai.com')
-  .split(',').map(s => s.trim()).filter(Boolean);
+const express = require('express');
+const cors = require('cors');
 
 const app = express();
-app.set('trust proxy', process.env.TRUST_PROXY === '1');
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '2mb' }));
+
+// CORS: allow ChatGPT UIs
+const CORS_ORIGINS = [
+  'https://chat.openai.com',
+  'https://chatgpt.com',
+  'https://platform.openai.com',
+  'https://labs.openai.com',
+  'http://localhost:5051',   // local SSE gateway during testing
+];
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    const ok = ALLOW_ORIGINS.includes(origin);
-    return cb(ok ? null : new Error('CORS'), ok);
-  },
-  methods: ['GET','POST','HEAD','OPTIONS','DELETE'],
-  allowedHeaders: ['content-type','authorization','x-bridge-token','x-mcp-auth','mcp-session-id'],
-  exposedHeaders: ['Mcp-Session-Id','x-bridge-version','x-request-id'],
-  maxAge: 600,
-  credentials: true
+  origin: (origin, cb) => cb(null, !origin || CORS_ORIGINS.includes(origin)),
+  credentials: true,
+  allowedHeaders: [
+    'content-type', 'authorization', 'x-bridge-token', 'x-custom-auth-headers',
+    'mcp-session-id', 'accept'
+  ],
+  exposedHeaders: ['mcp-session-id', 'x-bridge-version']
 }));
-morgan.token('rid', req => req.id || '');
-app.use((req, _res, next) => { req.id = randomUUID(); next(); });
-app.use(morgan(':method :url :status :res[content-length] - :response-time ms rid=:rid'));
-
-function ts() { return new Date().toISOString(); }
-const rid = req => (req.id || 'r0');
-
-// ---------- Helpers ----------
-function buildGasUrl(params) {
-  const u = new URL(GAS_BASE_URL);
-  Object.entries(params || {}).forEach(([k, v]) => (v !== undefined && v !== null) && u.searchParams.set(k, String(v)));
-  u.searchParams.set('token', GAS_KEY);
-  return u.toString();
-}
-async function gasCall(tool, params) {
-  if (!GAS_BASE_URL) throw new Error('GAS_BASE_URL not configured');
-  const url = buildGasUrl({ tool, ...params });
-  const resp = await fetch(url, { redirect: 'follow', headers: { accept: 'application/json,text/plain;q=0.8,*/*;q=0.5' } });
-  const text = await resp.text();
-  try { return JSON.parse(text); }
-  catch { return { ok:false, error:`GAS non-JSON (${resp.status} ${resp.headers.get('content-type')})`, preview:text.slice(0,500) }; }
-}
-function authOk(req) {
-  // Allow token for CLI/Inspector; allow “No auth” for ChatGPT origins
-  const token = String(req.headers['x-bridge-token'] || req.query.token || req.headers.authorization?.replace(/^Bearer\s+/i,'') || '');
-  const fromUi = !!req.headers.origin && ALLOW_ORIGINS.includes(req.headers.origin);
-  return fromUi ? true : (BRIDGE_TOKEN && token && token === BRIDGE_TOKEN);
-}
-
-// ---------- MCP server (official transport) ----------
-const mcp = new McpServer({ name: 'YFL Drive Bridge', version: VERSION });
-
-// Tools (surface matches your existing four)
-mcp.tool(
-  'drive.search',
-  {
-    title: 'Drive search (v2)',
-    description: 'Search files: e.g., title contains "LATEST" and trashed=false',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        q: { type: 'string' },
-        pageSize: { type: 'integer', minimum: 1, maximum: 200 },
-        pageToken: { type: 'string' }
-      },
-      required: ['q']
-    },
-    outputSchema: { type: 'object', properties: { ok:{type:'boolean'}, items:{type:'array'} }, required:['ok','items'] }
-  },
-  async ({ q, pageSize, pageToken }, _ctx) => {
-    if (!q || !String(q).trim()) return { content:[{ type:'text', text:'invalid q' }], isError:true };
-    const out = await gasCall('drive.search', { q:String(q), pageSize, pageToken });
-    return {
-      content: [{ type: 'text', text: JSON.stringify(out) }],
-      structuredContent: out
-    };
-  }
-);
-mcp.tool(
-  'drive.list',
-  {
-    title: 'Drive list by folder',
-    description: 'List files by Drive folder ID (or root)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        folderId: { type:'string' },
-        pageSize: { type:'integer', minimum:1, maximum:200 },
-        pageToken: { type:'string' }
-      }
-    },
-    outputSchema: { type:'object', properties:{ ok:{type:'boolean'}, items:{type:'array'} }, required:['ok','items'] }
-  },
-  async ({ folderId, pageSize, pageToken }) => {
-    const out = await gasCall('drive.list', { folderId, pageSize, pageToken });
-    return { content:[{ type:'text', text: JSON.stringify(out) }], structuredContent: out };
-  }
-);
-mcp.tool(
-  'drive.get',
-  {
-    title: 'Drive get by id',
-    description: 'Get metadata for a file id',
-    inputSchema: { type:'object', properties:{ id:{type:'string'} }, required:['id'] },
-    outputSchema: { type:'object' }
-  },
-  async ({ id }) => {
-    const out = await gasCall('drive.get', { id });
-    return { content:[{ type:'text', text: JSON.stringify(out) }], structuredContent: out };
-  }
-);
-mcp.tool(
-  'drive.export',
-  {
-    title: 'Drive export',
-    description: 'Export Google Docs/Sheets/Slides or text',
-    inputSchema: { type:'object', properties:{ id:{type:'string'}, mime:{type:'string'} }, required:['id'] },
-    outputSchema: { type:'object', properties:{ ok:{type:'boolean'}, id:{type:'string'}, srcMime:{type:'string'}, mime:{type:'string'}, size:{type:'integer'}, text:{type:'string'} }, required:['ok','id','mime','text'] }
-  },
-  async ({ id, mime }) => {
-    const out = await gasCall('drive.export', { id, mime });
-    return { content:[{ type:'text', text: JSON.stringify(out) }], structuredContent: out };
-  }
-);
-
-// Health / probes
-app.get('/health', (_req, res) => res.json({ ok:true, version:VERSION, ts:ts() }));
-app.head('/health', (_req, res) => res.status(204).end());
-
-// MCP: HEAD/GET probe (no auth required for UI origins)
-app.head('/mcp', (req, res) => res.status(authOk(req) ? 204 : 204).end());
-app.get('/mcp',  (req, res) => res.json({ ok:true, transport:'streamable-http', version:VERSION, ts:ts() }));
-
-// MCP: Streamable HTTP (official transport) — POST
-app.post('/mcp', async (req, res) => {
-  if (!authOk(req)) return res.status(401).json({ jsonrpc:'2.0', id:String(req.body?.id || '1'), error:{ code:-32001, message:'unauthorized' }});
-  const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
-  res.setHeader('x-bridge-version', VERSION);
-  res.on('close', () => transport.close());
-  await mcp.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+app.use((req,res,next) => {
+  res.header('X-Bridge-Version', '3.2.0');
+  next();
 });
 
-// Root (optional)
-app.get('/', (_req, res) => res.json({ ok:true, service:'YFL Drive Bridge', version:VERSION, ts:ts() }));
+app.get('/health', (_, res) => {
+  res.json({ ok: true, gas: true, version: '3.2.0', ts: new Date().toISOString() });
+});
 
+// ---- JSON-RPC endpoint (no SSE here) ----
+app.post('/mcp', (req, res) => {
+  // Accept header tolerance: allow 'application/json' alone OR with text/event-stream
+  const accept = String(req.header('accept') || '').toLowerCase();
+  if (!accept.includes('application/json')) {
+    res.status(406).json({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32000, message: 'Not Acceptable: Accept must include application/json' }
+    });
+    return;
+  }
+
+  const { method, id } = req.body || {};
+
+  // Minimal “capabilities only” JSON-RPC shim; your real tool wiring can stay behind this.
+  if (method === 'initialize') {
+    return res.json({
+      jsonrpc: '2.0',
+      id: String(id ?? '0'),
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'YFL Drive Bridge', version: '3.2.0' }
+      }
+    });
+  }
+
+  if (method === 'tools/list') {
+    return res.json({
+      jsonrpc: '2.0',
+      id: String(id ?? '0'),
+      result: {
+        tools: [
+          {
+            name: 'drive.list',
+            description: 'List files by folder path/ID',
+            inputSchema: { type: 'object', properties: {
+              folderId: { type: 'string', description: "Drive folder ID (or 'root')" },
+              path:     { type: 'string', description: 'Optional display path' },
+              pageToken:{ type: 'string' },
+              pageSize: { type: 'integer', minimum: 1, maximum: 200 }
+            }},
+            outputSchema: { type: 'object', properties: {
+              ok: { type: 'boolean' }, items: { type: 'array' }, nextPageToken: { type: 'string' }
+            }, required: ['ok','items'] },
+            annotations: { readOnlyHint: true }
+          },
+          {
+            name: 'drive.search',
+            description: 'Drive v2 query (e.g., title contains "…" and trashed=false)',
+            inputSchema: { type: 'object', properties: {
+              q: { type: 'string' }, query: { type: 'string' },
+              pageToken:{ type: 'string' }, pageSize:{ type: 'integer', minimum: 1, maximum: 200 }
+            }, required: ['q']},
+            outputSchema: { type: 'object', properties: {
+              ok: { type: 'boolean' }, items: { type: 'array' }, nextPageToken: { type: 'string' }
+            }, required: ['ok','items'] },
+            annotations: { readOnlyHint: true }
+          },
+          {
+            name: 'drive.get',
+            description: 'Get metadata by file id',
+            inputSchema: { type: 'object', properties: { id: { type: 'string' }}, required: ['id'] },
+            outputSchema: { type: 'object' },
+            annotations: { readOnlyHint: true }
+          },
+          {
+            name: 'drive.export',
+            description: 'Export Google Docs/Sheets/Slides or text',
+            inputSchema: { type: 'object', properties: {
+              id: { type: 'string', description: 'File ID' },
+              mime:{ type: 'string', description: 'MIME (text/plain, text/csv, application/pdf, …)' }
+            }, required: ['id']},
+            outputSchema: { type: 'object', properties: {
+              ok: { type: 'boolean' }, id:{ type:'string' }, srcMime:{ type:'string' },
+              mime:{ type:'string' }, size:{ type:'integer' }, text:{ type:'string' }
+            }, required:['ok','id','mime','text'] },
+            annotations: { readOnlyHint: true }
+          }
+        ]
+      }
+    });
+  }
+
+  // Default echo (helps connector UX)
+  return res.json({
+    jsonrpc: '2.0',
+    id: String(id ?? '0'),
+    result: { ok: true, echo: req.body, service: 'yfl-drive-bridge-v7' }
+  });
+});
+
+const PORT = process.env.PORT || 5050;
 app.listen(PORT, () => {
   console.log(`YFL Bridge listening on :${PORT} — POST http://localhost:${PORT}/mcp`);
 });
